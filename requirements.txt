@@ -1,14 +1,15 @@
 django==1.4.5
 pymongo
 simplejson
-python-memcached
 django-email-as-username
 diff_match_patch
 dateutils
 BeautifulSoup
 bleach
-django_mailchimp
+rauth
 functional
 pyes
 redis
 django-redis
+pyelasticsearch
+pytest

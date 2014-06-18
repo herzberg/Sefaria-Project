@@ -2,7 +2,9 @@ from django.conf.urls import patterns, include, url
 from django.conf.urls.defaults import *
 from django.contrib import admin
 from django.http import HttpResponseRedirect
+
 from emailusernames.forms import EmailAuthenticationForm
+
 from sefaria.forms import HTMLPasswordResetForm
 from sefaria.settings import DOWN_FOR_MAINTENANCE
 
@@ -11,24 +13,39 @@ admin.autodiscover()
 # Texts API
 urlpatterns = patterns('reader.views',
     (r'^api/texts/versions/(?P<ref>.+)$', 'versions_api'),
+    (r'^api/texts/parashat_hashavua$', 'parashat_hashavua_api'),
     (r'^api/texts/(?P<ref>.+)/(?P<lang>\w\w)/(?P<version>.+)$', 'texts_api'),
     (r'^api/texts/(?P<ref>.+)$', 'texts_api'),
     (r'^api/index/?$', 'table_of_contents_api'),
-    (r'^api/index/list/?$', 'table_of_contents_list_api'),
     (r'^api/index/titles/?$', 'text_titles_api'),
-    (r'^api/counts/(?P<title>.+)$', 'counts_api'),
     (r'^api/index/(?P<title>.+)$', 'index_api'),
     (r'^api/links/(?P<link_id>.*)$', 'links_api'),
     (r'^api/notes/(?P<note_id>.+)$', 'notes_api'),
+    (r'^api/counts/(?P<title>.+)$', 'counts_api'),
+)
+
+# Reviews API
+urlpatterns += patterns('reader.views',
+    (r'^api/reviews/(?P<ref>.+)/(?P<lang>\w\w)/(?P<version>.+)$', 'reviews_api'),
+    (r'^api/reviews/(?P<review_id>.+)$', 'reviews_api'),
+)
+
+# History API
+urlpatterns += patterns('reader.views',
     (r'^api/history/(?P<ref>.+)/(?P<lang>\w\w)/(?P<version>.+)$', 'texts_history_api'),
     (r'^api/history/(?P<ref>.+)$', 'texts_history_api'),
 )
 
-# Locks API
+# Edit Locks API (temporary locks on segments during editing)
 urlpatterns += patterns('reader.views',
     (r'^api/locks/set/(?P<ref>.+)/(?P<lang>\w\w)/(?P<version>.+)$', 'set_lock_api'),
     (r'^api/locks/release/(?P<ref>.+)/(?P<lang>\w\w)/(?P<version>.+)$', 'release_lock_api'),
     (r'^api/locks/check/(?P<ref>.+)/(?P<lang>\w\w)/(?P<version>.+)$', 'check_lock_api'),
+)
+
+# Lock Text API (permament locking of an entire text)
+urlpatterns += patterns('reader.views',
+    (r'^api/locktext/(?P<title>.+)/(?P<lang>\w\w)/(?P<version>.+)$', 'lock_text_api'),
 )
 
 # Campaigns 
@@ -57,20 +74,30 @@ urlpatterns += patterns('reader.views',
     (r'^search/?$', 'search'),
 )
 
-# Source Sheets & Topics
+# Source Sheets
 urlpatterns += patterns('sheets.views',
     (r'^sheets/?$', 'sheets_list'),
-    (r'^sheets/new?$', 'new_sheet'),
+    (r'^sheets/new/?$', 'new_sheet'),
+    (r'^sheets/tags/?$', 'sheets_tags_list'),
+    (r'^sheets/tags/(?P<tag>.+)$', 'sheets_tag'),
     (r'^sheets/(?P<type>(public|private|allz))/?$', 'sheets_list'),
     (r'^sheets/(?P<sheet_id>\d+)$', 'view_sheet'),
     (r'^topics/?$', 'topics_list'),
     (r'^topics/(?P<topic>.+)$', 'topic_view'),
+)
+
+# Source Sheets API
+urlpatterns += patterns('sheets.views',    
     (r'^api/sheets/$', 'sheet_list_api'),
     (r'^api/sheets/(?P<sheet_id>\d+)/delete$', 'delete_sheet_api'),
     (r'^api/sheets/(?P<sheet_id>\d+)/add$', 'add_source_to_sheet_api'),
     (r'^api/sheets/(?P<sheet_id>\d+)/add_ref$', 'add_ref_to_sheet_api'),
     (r'^api/sheets/(?P<sheet_id>\d+)/copy_source$', 'copy_source_to_sheet_api'),
+    (r'^api/sheets/(?P<sheet_id>\d+)/tags$', 'update_sheet_tags_api'),
     (r'^api/sheets/(?P<sheet_id>\d+)$', 'sheet_api'),
+    (r'^api/sheets/(?P<sheet_id>\d+)/like$', 'like_sheet_api'),
+    (r'^api/sheets/(?P<sheet_id>\d+)/unlike$', 'unlike_sheet_api'),
+    (r'^api/sheets/(?P<sheet_id>\d+)/likers$', 'sheet_likers_api'),
     (r'^api/sheets/user/(?P<user_id>\d+)$', 'user_sheet_list_api'),
     (r'^api/sheets/modified/(?P<sheet_id>\d+)/(?P<timestamp>.+)$', 'check_sheet_modified_api'),
 
@@ -84,10 +111,22 @@ urlpatterns += patterns('reader.views',
     (r'^api/revert/(?P<ref>[^/]+)/(?P<lang>.{2})/(?P<version>.+)/(?P<revision>\d+)$', 'revert_api'),
 )
 
-# Profiles 
+# Profiles & Settings
 urlpatterns += patterns('reader.views',
     (r'^contributors/(?P<username>[^/]+)(/(?P<page>\d+))?$', 'user_profile'),
-    (r'^acapi/profile$', 'profile_api'),
+    (r'^account/settings/?$', 'account_settings'),
+    (r'^api/profile$', 'profile_api'),
+)
+
+# Notifications API
+urlpatterns += patterns('reader.views',
+    (r'^api/notifications/?$', 'notifications_api'),
+    (r'^api/notifications/read', 'notifications_read_api'),
+)
+
+# Messages API
+urlpatterns += patterns('reader.views',
+    (r'^api/messages/?$', 'messages_api'),
 )
 
 # Partners 
@@ -129,6 +168,8 @@ urlpatterns += patterns('sefaria.views',
 urlpatterns += patterns('', 
     (r'^admin/reset/cache', 'sefaria.views.reset_cache'),
     (r'^admin/reset/counts', 'sefaria.views.reset_counts'),
+    (r'^admin/rebuild/toc', 'sefaria.views.rebuild_toc'),
+    (r'^admin/save/toc', 'sefaria.views.save_toc'),
     (r'^admin/?', include(admin.site.urls)),
 )
 

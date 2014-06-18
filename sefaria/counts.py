@@ -1,7 +1,19 @@
+"""
+counts.py - functions for counting and the number of available segments and versions of a text.
+
+Writes to MongoDB Collection: counts
+
+Counts documents exist for each text as well as each category of texts. Documents for 
+texts are keyed by the 'title' field, documents for categories are keyed by the 'categories'
+field, which is an array of strings.
+"""
 from collections import defaultdict
 from pprint import pprint
 
-import texts as sefaria
+import texts
+import summaries
+from util import *
+from database import db
 
 
 def count_texts(ref, lang=None):
@@ -10,7 +22,7 @@ def count_texts(ref, lang=None):
 	"""
 	counts = []
 
-	pref = sefaria.parse_ref(ref)
+	pref = texts.parse_ref(ref)
 	if "error" in pref:
 		return pref
 	depth = pref["textDepth"]
@@ -20,8 +32,8 @@ def count_texts(ref, lang=None):
 	if lang:
 		query["language"] = lang
 
-	texts = sefaria.db.texts.find(query)
-	for text in texts:
+	all_texts = db.texts.find(query)
+	for text in all_texts:
 		# TODO Look at the sections requested in ref, not just total book
 		this_count = count_array(text["chapter"])
 		counts = sum_count_arrays(counts, this_count)
@@ -44,18 +56,18 @@ def update_counts(ref=None):
  		update_text_count(ref)
 		return
 
-	indices = sefaria.db.index.find({})
+	indices = db.index.find({})
 
 	for index in indices:
 		if index["categories"][0] == "Commentary":
 			cRef = "^" + index["title"] + " on "
-			texts = sefaria.db.texts.find({"title": {"$regex": cRef}})
+			texts = db.texts.find({"title": {"$regex": cRef}})
 			for text in texts:
 				update_text_count(text["title"], index)
 		else:	
 			update_text_count(index["title"])
 
-	sefaria.update_summaries()
+	summaries.update_summaries()
 
 
 def update_text_count(ref, index=None):
@@ -63,14 +75,14 @@ def update_text_count(ref, index=None):
 	Update the count records of the text specfied 
 	by ref (currently at book level only) by peforming a count
 	"""	
-	index = sefaria.get_index(ref)
+	index = texts.get_index(ref)
 	if "error" in index:
 		return index
 
 	c = { "title": ref }
-	sefaria.db.counts.remove(c)
+	db.counts.remove(c)
 
-	if index["categories"][0] in ("Tanach", "Mishna", "Talmud"):
+	if index["categories"][0] in ("Tanach", "Mishnah", "Talmud"):
 		# For these texts, consider what is present in the db across 
 		# English and Hebrew to represent actual total counts
 		counts = count_texts(ref)
@@ -127,7 +139,7 @@ def update_text_count(ref, index=None):
 		"en": ep > 99.9,
 	}
 
-	sefaria.db.counts.save(c)
+	db.counts.save(c)
 	return c
 
 
@@ -159,10 +171,10 @@ def count_category(cat, lang=None):
 		
 		# Save to the DB
 		remove_doc = {"$and": [{'categories.0': cat[0]}, {"categories": {"$all": cat}}, {"categories": {"$size": len(cat)}} ]}
-		sefaria.db.counts.remove(remove_doc)
+		db.counts.remove(remove_doc)
 		counts_doc = {"categories": cat}
 		counts_doc.update(counts)
-		sefaria.db.counts.save(counts_doc)
+		db.counts.save(counts_doc)
 
 		return counts
 
@@ -172,10 +184,10 @@ def count_category(cat, lang=None):
 	percent = 0.0
 	percentCount = 0
 	cat = [cat] if isinstance(cat, basestring) else cat
-	texts = sefaria.db.index.find({"$and": [{'categories.0': cat[0]}, {"categories": {"$all": cat}}]})
+	texts = db.index.find({"$and": [{'categories.0': cat[0]}, {"categories": {"$all": cat}}]})
 	for text in texts:
 		counts["Text"] += 1
-		text_count = sefaria.db.counts.find_one({ "title": text["title"] })
+		text_count = db.counts.find_one({ "title": text["title"] })
 		if not text_count or "availableCounts" not in text_count or "sectionNames" not in text:
 			continue
 	
@@ -204,13 +216,31 @@ def get_category_count(categories):
 	"""
 	Returns the counts doc stored in the matching category list 'categories'
 	"""
-
 	# This ugly query is an approximation for the extact array in order
-	doc = sefaria.db.counts.find_one({"$and": [{'categories.0': categories[0]}, {"categories": {"$all": categories}}, {"categories": {"$size": len(categories)}} ]})
+	# WARNING: This query get confused is we ever have two lists of categories which have 
+	# the same length, elements, and first element, but different order. (e.g ["a", "b", "c"] and ["a", "c", "b"])
+	doc = db.counts.find_one({"$and": [{'categories.0': categories[0]}, {"categories": {"$all": categories}}, {"categories": {"$size": len(categories)}} ]})
 	if doc:
 		del doc["_id"]
 
 	return doc
+
+
+def update_category_counts():
+	"""
+	Recounts all category docs and saves to the DB.
+	"""
+	categories = set()
+	indices = db.index.find()
+	for index in indices:
+		for i in range(len(index["categories"])):
+			# perform a count for each sublist. E.g, for ["Talmud", "Bavli", "Seder Zeraim"]
+			# also count ["Talmud"] and ["Talmud", "Bavli"]
+			categories.add(tuple(index["categories"][0:i+1]))
+
+	categories = [list(cats) for cats in categories]
+	for cats in categories:
+		count_category(cats)
 
 
 def count_array(text):
@@ -230,7 +260,6 @@ def sum_count_arrays(a, b):
 	two multidimensional arrays of ints. Missing elements are given 0 value.
 	[[1, 2], [3, 4]] + [[2,3], [4]] = [[3, 5], [7, 4]]
 	"""
-	
 	# Treat None as 0 
 	if a is None:
 		return sum_count_arrays(0, b) 
@@ -290,7 +319,7 @@ def zero_jagged_array(array):
 
 def count_words_in_texts(curr):
 	"""
-	Counts all the words of texts in curr, 
+	Counts all the words of texts in curr.
 	"""
 	total = sum([count_words(t["chapter"]) for t in curr ])
 	return total
@@ -307,6 +336,27 @@ def count_words(text):
 	else:
 		return 0
 
+
+def count_characters_in_texts(curr):
+	"""
+	Counts all the characters of texts in curr.
+	"""
+	total = sum([count_characters(t["chapter"]) for t in curr ])
+	return total
+
+
+def count_characters(text):
+	"""
+	Counts the number of characters in a jagged array whose terminals are strings.
+	"""
+	if isinstance(text, basestring):
+		return len(text)
+	elif isinstance(text, list):
+		return sum([count_words(i) for i in text])
+	else:
+		return 0
+
+
 def get_percent_available(text, lang="en"):
 	"""
 	Returns the percentage of 'text' available in 'lang',
@@ -322,17 +372,20 @@ def get_percent_available(text, lang="en"):
 
 def get_available_counts(text, lang="en"):
 	"""
-	Returns the available count dictionary of 'text' in 'lang',=
-	where text is a text title, text category or list of categories. 
+	Returns the available counts dictionary of 'text' in 'lang',
+	where text is a text title, text category or list of categories.
+
+	The avalable counts dictionary counts the number of sections availble in 
+	a text, keyed by the various section names which apply to it.
 	"""
 	c = get_counts_doc(text)
 	if not c:
 		return None
 
 	if "title" in c:
-		# counts docs for individual have different shape
-		i = sefaria.db.index.find_one({"title": c["title"]})
-		c["availableCounts"] = sefaria.make_available_counts_dict(i, c)
+		# count docs for individual texts have different shape
+		i = db.index.find_one({"title": c["title"]})
+		c["availableCounts"] = make_available_counts_dict(i, c)
 
 	if c and lang in c["availableCounts"]:
 		return c["availableCounts"][lang]
@@ -346,30 +399,39 @@ def get_counts_doc(text):
 	where text is a text title, text category or list of categories. 
 	"""	
 	if isinstance(text, list):
-		query = {"category": {"$all": text}}
-	else:
-		i = sefaria.get_index(text)
-		if "error" in i:
-			# This isn't a text title, try treating it as a category.
-			# Look up the first text matching this category and 
-			# use its complete categories list
-			# (e.g., "Prophets" -> ["Tanach", "Prophets"])
-			example = sefaria.db.index.find_one({"categories": text})
-			if not example:
-				# if we don't have a single text in this category,
-				# then we have nothing.
-				return None
-			# Don't use subcategories if this is a top level category
-			if example["categories"][0] == text:
-				query = {"$and": [{'category.0': {"$exists": False}}, {"category": text}]}
-			else:
-				query = {"category": {"$all": example["categories"]}}
-		else:
-			query = {"title": text}
+		# text is a list of categories
+		return get_category_count(text)
+	
+	categories = texts.get_text_categories()
+	if text in categories:
+		# text is a single category name
+		return get_category_count([text])
 
-	c = sefaria.db.counts.find_one(query)
-
+	# Treat 'text' as a text title
+	query = {"title": text}
+	c = db.counts.find_one(query)
 	return c
+
+
+def make_available_counts_dict(index, count):
+	"""
+	For index and count doc for a text, return a dictionary 
+	which zips together section names and available counts. 
+	Special case Talmud. 
+	"""
+	counts = {"en": {}, "he": {} }
+	if count and "sectionNames" in index and "availableCounts" in count:
+		for num, name in enumerate(index["sectionNames"]):
+			if "Talmud" in index["categories"] and name == "Daf":
+				counts["he"]["Amud"] = count["availableCounts"]["he"][num]
+				counts["he"]["Daf"]  = counts["he"]["Amud"] / 2
+				counts["en"]["Amud"] = count["availableCounts"]["en"][num]
+				counts["en"]["Daf"]  = counts["en"]["Amud"] / 2
+			else:
+				counts["he"][name] = count["availableCounts"]["he"][num]
+				counts["en"][name] = count["availableCounts"]["en"][num]
+	
+	return counts
 
 
 def get_untranslated_count_by_unit(text, unit):
@@ -400,3 +462,92 @@ def get_translated_count_by_unit(text, unit):
 
 	return en[unit]
 
+
+def is_ref_available(ref, lang):
+	"""
+	Returns True if at least one complete version of ref is available in lang.
+	"""
+	p = texts.parse_ref(ref)
+	if "error" in p:
+		return False
+	counts_doc = get_counts_doc(p["book"])
+	if not counts_doc:
+		counts_doc = update_text_count(p["book"])
+	counts = counts_doc["availableTexts"][lang]
+
+	segment = texts.grab_section_from_text(p["sections"], counts, toSections=p["toSections"])
+
+	if not isinstance(segment, list):
+		segment = [segment]
+	return all(segment)
+
+
+def is_ref_translated(ref):
+	"""
+	Returns True if at least one complete version of ref is available in English.
+	"""
+	return is_ref_available(ref, "en")
+
+
+def generate_refs_list(query={}):
+	"""
+	Generate a list of refs to all available sections.
+	"""
+	refs = []
+	counts = db.counts.find(query)
+	for c in counts:
+		if "title" not in c:
+			continue # this is a category count
+
+		i = texts.get_index(c["title"])
+		if ("error" in i):
+			# If there is not index record to match the count record,
+			# the count should be removed.
+			db.counts.remove(c)
+			continue
+		title = c["title"]
+		he = list_from_counts(c["availableTexts"]["he"])
+		en = list_from_counts(c["availableTexts"]["en"])
+		sections = union(he, en)
+		for n in sections:
+			if i["categories"][0] == "Talmud":
+				n = texts.section_to_daf(int(n))
+			if "commentaryCategories" in i and i["commentaryCategories"][0] == "Talmud":
+				split = n.split(":")
+				n = ":".join([texts.section_to_daf(int(n[0]))] + split[1:])
+			ref = "%s %s" % (title, n) if n else title
+			refs.append(ref)
+
+	return refs
+
+
+def list_from_counts(count, pre=""):
+	"""
+	Recursive function to transform a count array (a jagged array counting
+	how many versions of each text segment are availble) into a list of
+	available sections numbers.
+
+	A section is considered available if at least one of its segments is available.
+
+	E.g., [[1,1],[0,1]]	-> [1,2]
+	      [[0,0], [1,0]] -> [2]
+		  [[[1,2], [0,1]], [[0,0], [1,0]]] -> [1:1, 1:2, 2:2]
+	"""
+	urls = []
+
+	if not count:
+		return urls
+
+	elif isinstance(count[0], int):
+		# The count we're looking at represents a section
+		# List it in urls if it not all empty
+		if not all(v == 0 for v in count):
+			urls.append(pre)
+			return urls
+
+	for i, c in enumerate(count):
+		if isinstance(c, list):
+			p = "%s:%d" % (pre, i+1) if pre else str(i+1)
+			urls += list_from_counts(c, pre=p)
+
+	return urls

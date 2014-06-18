@@ -37,6 +37,14 @@ Thumbs.db
 .htaccess
 .htpasswd
 
+# Redis Dumps #
+##############
+dump.rdb
+
+# PyCharm directory #
+#####################
+/.idea
+
 # Sefaria Local Settings file #
 ######################
 /sefaria/local_settings.py

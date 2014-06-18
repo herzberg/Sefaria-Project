@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
-import sys
-import os
-import re 
-import copy
+"""
+summaries.py - create and manage Table of Contents document for all texts
+
+Writes to MongoDB Collection: summaries
+"""
+from datetime import datetime
 from pprint import pprint
 
-from django.core.cache import cache
+import texts
+import counts
+from database import db
 
-import texts as sefaria
+toc_cache = []
 
 # Giant list ordering or categories
 # indentation and inclusion of duplicate categories (like "Seder Moed")
@@ -15,10 +19,15 @@ import texts as sefaria
 order = [ 
 	"Tanach",
 		"Torah",
+			"Genesis",
+			"Exodus",
+			"Leviticus",
+			"Numbers",
+			"Deuteronomy",
 		"Prophets",
 		"Writings",
 	'Commentary',
-	"Mishna",
+	"Mishnah",
 		"Seder Zeraim", 
 		"Seder Moed", 
 		"Seder Nashim", 
@@ -68,12 +77,12 @@ order = [
 		"Shulchan Arukh",
 	"Kabbalah",
 	'Liturgy',
+		'Siddur',
 	'Philosophy', 
 	'Chasidut',
 	'Musar',
 	'Responsa', 
 	'Elucidation', 
-	'Modern', 
 	'Other',
 			'Onkelos Genesis',
 			'Onkelos Exodus',
@@ -89,11 +98,16 @@ order = [
 
 def get_toc():
 	"""
-	Returns the table of contents object from cache,
-	or creates it if not currently cached. 
+	Returns table of contents object from in-memory cache,
+	DB or by generating it, as needed. 
 	"""
-	toc = cache.get("toc")
+	global toc_cache
+	if toc_cache:
+		return toc_cache
+
+	toc = get_toc_from_db()
 	if toc:
+		save_toc(toc)
 		return toc
 
 	return update_table_of_contents()
@@ -101,11 +115,34 @@ def get_toc():
 
 def save_toc(toc):
 	"""
-	Cache the table of contents objects,
-	and deletes other dependent caches. 
+	Saves the table of contents object to in-memory cache,
+	invalidtes texts_list cache.
 	"""
-	cache.set("toc", toc)
-	sefaria.delete_template_cache("texts_list")
+	global toc_cache
+	toc_cache = toc
+	texts.delete_template_cache("texts_list")
+
+
+def get_toc_from_db():
+	"""
+	Retrieves the table of contents stored in MongoDB.
+	"""
+	toc = db.summaries.find_one({"name": "toc"})
+	return toc["contents"] if toc else None
+
+
+def save_toc_to_db():
+	"""
+	Saves table of contents to MongoDB.
+	(This write can be slow.) 
+	"""
+	db.summaries.remove()
+	toc_doc = {
+		"name": "toc",
+		"contents": toc_cache,
+		"dateSaved": datetime.now(),
+	}
+	db.summaries.save(toc_doc)
 
 
 def update_table_of_contents():
@@ -117,7 +154,7 @@ def update_table_of_contents():
 	toc = []
 
 	# Add an entry for every text we know about
-	indices = sefaria.db.index.find()
+	indices = db.index.find()
 	for i in indices:
 		del i["_id"]
 		if i["categories"][0] == "Commentary":
@@ -131,9 +168,9 @@ def update_table_of_contents():
 
 	# Special handling to list available commentary texts which do not have
 	# individual index records
-	commentary_texts = sefaria.get_commentary_texts_list()
+	commentary_texts = texts.get_commentary_texts_list()
 	for c in commentary_texts:
-		i = sefaria.get_index(c)
+		i = texts.get_index(c)
 		node = get_or_make_summary_node(toc, i["categories"])
 		text = add_counts_to_index(i)
 		node.append(text)
@@ -146,6 +183,8 @@ def update_table_of_contents():
 	toc = sort_toc_node(toc, recur=True)
 
 	save_toc(toc)
+	save_toc_to_db()
+
 	return toc
 
 
@@ -154,19 +193,19 @@ def update_summaries_on_change(ref, old_ref=None, recount=True):
 	Update text summary docs to account for change or insertion of 'text'
 	* recount - whether or not to perform a new count of available text
 	"""
-	toc = get_toc()
-	index = sefaria.get_index(ref)
+	index = texts.get_index(ref)
 	if "error" in index:
 		return index
 
 	if recount:
-		sefaria.update_text_count(ref)
+		counts.update_text_count(ref)
 
 	resort_other = False
 	if index["categories"][0] not in order:
 		index["categories"].insert(0, "Other")
 		resort_other = True
 
+	toc = get_toc()
 	node = get_or_make_summary_node(toc, index["categories"])
 	text = add_counts_to_index(index)
 	
@@ -193,7 +232,7 @@ def update_summaries():
 	Update all stored documents which summarize known and available texts
 	"""
 	update_table_of_contents()
-	sefaria.reset_texts_cache()
+	texts.reset_texts_cache()
 	
 
 def get_or_make_summary_node(summary, nodes):
@@ -224,38 +263,17 @@ def add_counts_to_index(text):
 	Returns a dictionary representing a text which includes index info,
 	and text counts.
 	"""
-	count = sefaria.db.counts.find_one({"title": text["title"]}) or \
-			 sefaria.update_text_count(text["title"])
+	count = db.counts.find_one({"title": text["title"]}) or \
+			 counts.update_text_count(text["title"])
 	if not count:
 		return text
 
 	if count and "percentAvailable" in count:
 		text["percentAvailable"] = count["percentAvailable"]
 
-	text["availableCounts"] = make_available_counts_dict(text, count)
+	text["availableCounts"] = counts.make_available_counts_dict(text, count)
 
 	return text
-
-
-def make_available_counts_dict(index, count):
-	"""
-	For index and count doc for a text, return a dictionary 
-	which zips together section names and available counts. 
-	Special case Talmud. 
-	"""
-	counts = {"en": {}, "he": {} }
-	if count and "sectionNames" in index and "availableCounts" in count:
-		for num, name in enumerate(index["sectionNames"]):
-			if "Talmud" in index["categories"] and name == "Daf":
-				counts["he"]["Amud"] = count["availableCounts"]["he"][num]
-				counts["he"]["Daf"]  = counts["he"]["Amud"] / 2
-				counts["en"]["Amud"] = count["availableCounts"]["en"][num]
-				counts["en"]["Daf"]  = counts["en"]["Amud"] / 2
-			else:
-				counts["he"][name] = count["availableCounts"]["he"][num]
-				counts["en"][name] = count["availableCounts"]["en"][num]
-	
-	return counts
 
 
 def add_counts_to_category(cat, parents=[]):
@@ -277,8 +295,8 @@ def add_counts_to_category(cat, parents=[]):
 		if "category" in subcat:
 			add_counts_to_category(subcat, parents=cat_list)
 
-	counts = sefaria.get_category_count(cat_list) or sefaria.count_category(cat_list)
-	cat.update(counts)
+	counts_doc = counts.get_category_count(cat_list) or counts.count_category(cat_list)
+	cat.update(counts_doc)
 
 	# count texts in this category by summing sub counts and counting texts
 	cat["num_texts"] = 0
@@ -300,24 +318,32 @@ def sort_toc_node(node, recur=False):
 
 	If 'recur', call sort_toc_node on each category in 'node' as well.
 	"""
-	def node_sort(a):
+	def node_sort_key(a):
 		if "category" in a:
+			print a["category"]
 			try:
 				return order.index(a["category"])
 			except ValueError:
-				return a["category"]
+				# If there is a text with the exact name as this category
+				# (e.g., "Bava Metzia" as commentary category)
+				# sort by text's order
+				i = db.index.find_one({"title": a["category"]})
+				if i and "order" in i:
+					return i["order"][-1]
+				else:
+					return a["category"]
 		elif "title" in a:
 			try:
 				return order.index(a["title"])
 			except ValueError:
 				if "order" in a:
-					return a["order"][0]
+					return a["order"][-1]
 				else:
 					return a["title"]
 
 		return None
 
-	node = sorted(node, key=node_sort)
+	node = sorted(node, key=node_sort_key)
 
 	if recur:
 		for cat in node:
@@ -325,3 +351,22 @@ def sort_toc_node(node, recur=False):
 				cat["contents"] = sort_toc_node(cat["contents"], recur=True)
 
 	return node
+
+
+def get_texts_summaries_for_category(category):
+	"""
+	Returns the list of texts records in the table of contents corresponding to "category".
+	"""
+	toc = get_toc()
+	summary = []
+	for cat in toc:
+		if cat["category"] == category:
+			if "category" in cat["contents"][0]:
+				for cat2 in cat["contents"]:
+					summary += cat2["contents"]
+			else:
+				summary += cat["contents"]
+
+			return summary
+
+	return []

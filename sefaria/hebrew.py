@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
+"""
+hebrew.py - functions relating to reading and generating Hebrew numerals.
 
-# Issues:
-#   Numbers like 1 million are ambiguous
-#   Number like 2000 is ambiguous
-#   Okay to construct 15/16 and then make tet-vav/etc?
+Issues:
+   Numbers like 1 million are ambiguous
+   Number like 2000 is ambiguous
+   Okay to construct 15/16 and then make tet-vav/etc?
+"""
 
 import re
 import math
@@ -287,6 +290,10 @@ def encode_hebrew_numeral(n, punctuation=True):
 	ret = sanitize(ret, punctuation)
 
 	return ret
+
+
+def strip_nikkud(rawString):
+	return rawString.replace(r"[\u0591-\u05C7]", "");
 
 
 # def main():

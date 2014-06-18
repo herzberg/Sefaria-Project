@@ -8,6 +8,9 @@ $.extend(sjs,  {
 	view: {},       // cached values related to current view
 	editing: {},    // data related to current editing
 	ref: {},        // data relate to selecting a valid ref (e.g., in add source)
+	reviews: {      // data of text reviews
+		inProgress: {}
+	},
 	visible: {
 		first: 1,
 		last: 1
@@ -32,6 +35,12 @@ $.extend(sjs,  {
 	_verseHeights: [],  // stored list of the top positon of each verse
 	_scrollMap: []      // stored list of the window top position that should correspond to highlighting each verse
 });
+
+
+sjs.ratySettings = { // for text review ratings
+	path: "/static/img/raty/",
+	hints: ["Major problems", "Some problems", "Seems good", "Good", "Definately good"]
+};
 
 
 //  Initialize everything
@@ -76,12 +85,14 @@ sjs.Init.all = function() {
 			sjs.showNewText();	
 			break;
 		case "edit":
-			sjs.current.langMode = sjs.current.text.length ? 'en' : 'he';
+			sjs.langMode = sjs.current.text.length ? 'en' : 'he';
 			sjs.editText(sjs.current);
 			break;
 		case "translate":
 			sjs.translateText(sjs.current);
 			break;
+		case "review":
+			sjs.reviewText(sjs.current);
 	}
 };
 
@@ -106,14 +117,20 @@ sjs.Init._$ = function() {
 sjs.Init.loadView = function () {
 	sjs.cache.save(sjs.current);
 	History.replaceState(parseRef(sjs.current.ref), sjs.current.ref + " | Sefaria.org", null);
+
 	var params = getUrlVars();
 	if ("source" in params) {
 		sjs.textFilter = params["source"].replace(/_/g, " ");
 	}
 	buildView(sjs.current);
-	if (sjs.current.langMode == "bi") { 
+	if (sjs.langMode == "bi") { 
 		$("#bilingual").trigger("click");
 	}
+
+	if ("nav_query" in params) {
+		sjs.searchInsteadOfNav(params.nav_query);
+	}
+	
 	sjs.thread = [sjs.current.ref];
 	sjs.track.open(sjs.current.ref);
 };
@@ -239,12 +256,9 @@ sjs.Init.handlers = function() {
 	sjs.mousePanels = function(e) {
 		if (!sjs._$basetext.is(":visible") || $("#overlay").is(":visible") || e.clientY < 40) { return; }
 
-		var width = sjs.view.width;
-		var out = Math.max(width/4.5, 200);
-
-		if (e.clientX < 40 && !$("#about").hasClass("opened")) {
+		if (e.clientX < 20 && !$("#about").hasClass("opened")) {
 			sjs.timers.previewPanel = setTimeout('$("#about").addClass("opened");', 100);
-		} else if (width - e.clientX < 40 && !sjs._$sourcesList.hasClass("opened")) {
+		} else if (sjs.view.width - e.clientX < 20 && !sjs._$sourcesList.hasClass("opened")) {
 			sjs.timers.previewPanel = setTimeout('sjs._$sourcesList.addClass("opened");', 100);
 		} 
 	}
@@ -455,7 +469,7 @@ sjs.Init.handlers = function() {
 			if (!$(this).find("."+lang+" .credits").children().length) {
 				var version = (lang === "en" ? sjs.current.versionTitle : sjs.current.heVersionTitle);
 				if (!version) { continue; }
-				var url = "/api/history/" + sjs.current.ref.replace(" ", "_") + "/" +
+				var url = "/api/history/" + sjs.current.pageRef.replace(" ", "_") + "/" +
 											lang + "/" +
 											version.replace(" ", "_");
 				
@@ -463,7 +477,9 @@ sjs.Init.handlers = function() {
 				var setCredits = function(data, lang) {
 					var html =  (data["translators"].length ? "<div class='credit'>Translated by " + data["translators"].map(getLink).join(", ") + "</div>" : "") +
 								(data["copiers"].length ? "<div class='credit'>Copied by " + data["copiers"].map(getLink).join(", ") + "</div>" : "") +
-								(data["editors"].length ? "<div class='credit'>Edited by " + data["editors"].map(getLink).join(", ") + "</div>" : "");
+								(data["editors"].length ? "<div class='credit'>Edited by " + data["editors"].map(getLink).join(", ") + "</div>" : "") +
+								(data["reviewers"].length ? "<div class='credit'>Reviewed by " + data["reviewers"].map(getLink).join(", ") + "</div>" : "");
+
 					$("#about").find("." + lang + " .credits").html(html);
 				}
 				var setCreditsWrp = (function(lang) { 
@@ -519,65 +535,46 @@ sjs.Init.handlers = function() {
 	
 	// ------------------ Language Options ---------------
 	
-	$("#hebrew").click(function(){
-		sjs.current.langMode = 'he';
-		$.cookie("langMode", 'he');
+	sjs.changeLangMode = function() {
+		var mode = this.id;
+		var shortMode = this.id.substring(0,2);
+
+		sjs.langMode = shortMode;
+		$.cookie("langMode", shortMode);
+
 		$("#languageToggle .toggleOption").removeClass("active");
 		$(this).addClass("active");
-		sjs._$basetext.removeClass("english bilingual heLeft")
-			.addClass("hebrew");
-		$("body").removeClass("english bilingual").addClass("hebrew");
-		$("#layoutToggle").show();
-		$("#biLayoutToggle").hide();
+		sjs._$basetext.removeClass("english bilingual hebrew heLeft")
+			.addClass(mode);
+		$("body").removeClass("english hebrew bilingual")
+			.addClass(mode);
+		
+		if (mode === "bilingual") {
+			sjs._$basetext.addClass("heLeft");
+			$("body").addClass("heLeft");
+			$("#layoutToggle").hide();
+			$("#biLayoutToggle").show();
+		} else {
+			$("#layoutToggle").show();
+			$("#biLayoutToggle").hide();			
+		}
+
+		sjs.updateReviewsModal(shortMode);
+
 		setVerseHeights();
 		updateVisible();
-
 		return false;
-	});
+	};
+	$("#hebrew, #english, #bilingual").click(sjs.changeLangMode);
 	
-	$("#english").click(function(){
-		sjs.current.langMode = 'en';
-		$.cookie("langMode", 'en');
-		$("#languageToggle .toggleOption").removeClass("active");
-		$(this).addClass("active");
-		sjs._$basetext.removeClass("hebrew bilingual heLeft")
-			.addClass("english");
-		$("body").removeClass("hebrew bilingual").addClass("english");
-		$("#layoutToggle").show();
-		$("#biLayoutToggle").hide();
-		setVerseHeights();
-		updateVisible();
-
-		return false;
-
-	});
-	
-	$("#bilingual").click(function() {
-		sjs.current.langMode = 'bi';
-		$.cookie("langMode", 'bi');
-		$("#languageToggle .toggleOption").removeClass("active");
-		$(this).addClass("active");
-		sjs._$basetext.removeClass("english hebrew")
-			.addClass("bilingual heLeft");
-		$("body").removeClass("hebrew english").addClass("bilingual");
-		$("#layoutToggle").hide();
-		$("#biLayoutToggle").show();
-		setVerseHeights();
-		updateVisible();
-
-		return false;
-
-	});
 	
 	// ------------ Bilingual Layout Options ----------------
 
 	$("#heLeft").click(function() {
 		$("#biLayoutToggle .toggleOption").removeClass("active")
 		$(this).addClass("active")
-		sjs._$basetext.removeClass("english hebrew")
-			.addClass("bilingual heLeft");
-		setVerseHeights();	
-		updateVisible();
+		sjs._$basetext.addClass("heLeft");
+		$("body").addClass("heLeft");
 
 		return false;
 	});
@@ -585,10 +582,8 @@ sjs.Init.handlers = function() {
 	$("#enLeft").click(function() {
 		$("#biLayoutToggle .toggleOption").removeClass("active");
 		$(this).addClass("active");
-		sjs._$basetext.removeClass("english hebrew heLeft")
-			.addClass("bilingual");
-		setVerseHeights();
-		updateVisible();
+		sjs._$basetext.removeClass("heLeft");
+		$("body").removeClass("heLeft");
 
 		return false;
 	});
@@ -622,7 +617,6 @@ $(function() {
 		
 	$("#editText").click(sjs.editCurrent);
 	$(document).on("click", ".addThis", sjs.addThis);
-
 
 
 	// ---------------- Edit Text Info ----------------------------
@@ -797,6 +791,37 @@ $(function() {
 	$(document).on("click", ".translateThis", sjs.translateThis);
 
 	
+// ------------------- Reviews ------------------------
+
+	sjs.openReviews = function () {
+		var lang = ($(this).hasClass("en") ? "en" : "he");
+		sjs.updateReviewsModal(lang);
+		$("#reviewsModal").show().position({of: window}).draggable();
+		sjs.track.event("Reviews", "Open Reviews Modal", "");
+	};
+	$(document).on("click", ".reviewsButton", sjs.openReviews);
+
+	sjs.closeReviews = function() {
+		$("#reviewsModal").hide();
+		$("#reviewsText").text("");
+	};
+
+	$(document).on("click", "#reviewsModal .cancel", sjs.closeReviews);	
+	$(document).on("click", "#reviewsModal .save", sjs.saveReview);
+	$(document).on("click", ".reviewDelete", sjs.deleteReview);
+
+	$("#reviewText").change(sjs.storeReviewInProgress);
+
+	$("#reviewHelpLink").click(function(e){ 
+		e.preventDefault();
+		$("#reviewsModal").addClass("reviewHelp").position({of: window});
+	});
+	$("#reviewHelpOK").click(function(){
+		$("#reviewsModal").removeClass("reviewHelp");
+	});
+
+	$("#raty").raty(sjs.ratySettings);
+
 // -------------- Highlight Commentary on Verse Click -------------- 
 
 	 sjs.hoverHighlight = function(e) {
@@ -810,12 +835,12 @@ $(function() {
 			$(this).addClass("highlight");
 		}
 		$('[data-num="'+n+'"]').addClass("highlight");
-	}
+	};
 	$(document).on("mouseenter", ".verse, .commentary", sjs.hoverHighlight );
 
 	sjs.hoverHighlightOff = function(e) {
 		$(".highlight").removeClass("highlight");
-	}
+	};
 	$(document).on("mouseleave", ".verse, .commentary", sjs.hoverHighlightOff );
 
 
@@ -1157,6 +1182,7 @@ $(function() {
 			sjs._direction = 1;
 			get(parseRef(query));
 			sjs.track.ui("Nav Query");
+			sjs.searchInsteadOfNav(query);
 		} else {
 			window.location = "/search?q=" + query;
 		}
@@ -1176,7 +1202,43 @@ $(function() {
 			$(this).blur();
 		}
 	});
+
 		
+	// --------------- Locking Texts --------------------
+
+	sjs.lockTextButtonHandler = function(e) {
+		// handle a click to a lockTextButton by either locking or unlocking
+		// the current text.
+		if ($(this).hasClass("enVersion")) {
+			var lang = "en";
+			var version = sjs.current.versionTitle;
+		} else if ($(this).hasClass("heVersion")) {
+			var lang = "he";
+			var version = sjs.current.heVersionTitle;
+		} else {
+			return;
+		}
+
+		var url = "/api/locktext/" + sjs.current.book + "/" + lang + "/" + version;
+		var unlocking = $(this).hasClass("unlock");
+		if (unlocking) {
+			url += "?action=unlock";
+		}
+
+		$.post(url, {}, function(data) {
+			if ("error" in data) {
+				sjs.alert.message(data.error)
+			} else {
+				sjs.alert.message(unlocking ? "Text Unlocked" : "Text Locked");
+				location.reload();
+			}
+		}).fail(function() {
+			sjs.alert.message("Something went wrong. Sorry!");
+		});
+
+	};
+	$(document).on("click", ".lockTextButton", sjs.lockTextButtonHandler);
+
 				
 }); // ---------------- End DOM Ready --------------------------
 
@@ -1207,7 +1269,7 @@ sjs.bind = {
 
 		var ref =  $(this).attr("data-ref") || $(this).text();
 		if (!ref) return;
-		ref = $(this).hasClass("mishnaRef") ? "Mishna " + ref : ref;
+		ref = $(this).hasClass("mishnaRef") ? "Mishnah " + ref : ref;
 		sjs._direction = $(this).parent().attr("id") == "breadcrumbs" ? -1 : 1;
 		
 		get(parseRef(ref));
@@ -1360,10 +1422,12 @@ function buildView(data) {
 	sjs.typeFilter = sjs.typeFilter || 'all';
 	sjs.sourcesFilter = (sjs.textFilter === "all" ? sjs.typeFilter : sjs.textFilter);
 
+	// Set the ref for the whole page, which may differ from data.ref if a single segmented is highlighted
+	data.pageRef = (data.book + " " + data.sections.slice(0, data.sectionNames.length-1).join(":")).trim();
+
 	sjs.cache.save(data);
 	sjs.current = data;
 	
-
 	// Set Language based on what's available
 	if (data.he.length && data.text.length) {
 		$("#languageToggle").show();
@@ -1392,7 +1456,7 @@ function buildView(data) {
 		$("#about").addClass("empty");
 		$("#english").trigger("click");
 		$("#viewButtons").hide();
-	} 
+	}
 	
 	// Make a Fancy Title String
 	var sectionsString = "";
@@ -1428,11 +1492,7 @@ function buildView(data) {
 	$("#aboutTextTitle").html(data.book);
 	$("#aboutTextSections").html(sectionsString);
 	$("#aboutVersions").html(aboutHtml());	
-	
-	// Add unreviewed noticed if this is a user submitted translation
-	if (data.versionTitle === "Sefaria Community Translation") {
-		sjs._$aboutBar.prepend("<span class='reviewWarning en'>This translation has not yet been reviewed.");
-	}
+
 
 	// TODO - Can't properly handle editing text info for "Commentator on Book", disallow for now 
 	if (data.type == "Commentary") {
@@ -1454,17 +1514,16 @@ function buildView(data) {
 	}
 	
 	// Don't allow editing a locked text
-	if (data.versionStatus === "locked") {
+	if (data.versionStatus === "locked" && !sjs.is_moderator) {
 		$("#about").addClass("enLocked");
 	} else {
 		$("#about").removeClass("enLocked");
 	}
-	if (data.heVersionStatus === "locked") {
+	if (data.heVersionStatus === "locked" && !sjs.is_moderator) {
 		$("#about").addClass("heLocked");
 	} else {
 		$("#about").removeClass("heLocked");
 	}
-	
 
 	// Prefetch Next and Prev buttons
 	if (data.next) {
@@ -1485,7 +1544,7 @@ function buildView(data) {
 	}
 	
 	// Build Commentary if any
-	if (data.commentary.length) {
+	if (data.commentary && data.commentary.length) {
 		buildCommentary(data.commentary);
 		$("body").removeClass("noCommentary");
 	} else {
@@ -1513,6 +1572,9 @@ function buildView(data) {
 	$sourcesBox.show();	
 	sjs.bind.windowScroll();
 	sjs.flags.loading = false;
+
+	// Load textual reviews
+	sjs.loadReviews();
 	
 	// highlight verse (if indicated)
 	if (data.sections.length === data.textDepth) {
@@ -1879,7 +1941,7 @@ function sourcesHtml(commentary, selected, selectedEnd) {
 	}	
 	html += '</div>';
 
-
+	/*
 	// ------------------------- Build Types Filter ---------------------
 	html += "<div class='typesFilter'><div class='type label active' data-type='all'>" +
 				"<span class='count'>("  + sourceTotal + ")</span> All Connections</div>";
@@ -1905,14 +1967,18 @@ function sourcesHtml(commentary, selected, selectedEnd) {
 	for (var i = 0; i < sortable.length; i++) {
 		html += sortable[i][2];
 	}
-
 	html += '</div>';
+	*/
+
+
 	html += '<div class="sourcesActions">' + 
 				'<span class="btn btn-success addSource">Add a Source</span>' +
 				'<br><br>' +
 				'<span class="btn btn-success addNote">Add a Note</span>' +
 
 			'</div>';
+	
+
 	return html;
 }
 
@@ -1922,7 +1988,9 @@ function aboutHtml(data) {
 	// Retuns HTML for the About Text panel according to data.
 	data = data || sjs.current;
 
-	if (!(data.versionTitle || data.heVersionTitle)) { 
+	if (!(data.versionTitle || data.heVersionTitle || data.sources || data.heSources)) { 
+		// Check if we've got at least something to work worth. Either a single Hebrew or English 
+		// version or a merged Hebrew or English version.
 		return "<i><center>No text available.</center></i>"; 
 	}
 
@@ -1957,11 +2025,20 @@ function aboutHtml(data) {
 			html += "</div>";
 		} else {
 			var isSct = (version.title === "Sefaria Community Translation");
+
+			var sourceLink = (version.source.indexOf(".") == -1 || version.source.indexOf(" ") != -1 ? 
+				version.source:
+				'<a target="_blank" href="' + version.source + '">' + parseURL(version.source).host + '</a>'); 
 			html += '<div class="version '+version.lang+'">' +
 						(isSct ? "Original Translation" : '<div class="aboutTitle">' + version.title + '</div>' +
-						'<div class="aboutSource">Source: <a target="_blank" href="' + version.source + '">' + parseURL(version.source).host + '</a></div>') +
+						'<div class="aboutSource">Source: ' + sourceLink +'</div>') +
 						'<div class="credits"></div>' +
-						'<a class="historyLink" href="/activity/'+data.ref+'/'+version.lang+'/'+version.title.replace(/ /g, "_")+'">Full history &raquo;</a>' + 
+						'<a class="historyLink" href="/activity/'+data.pageRef.replace(/ /g, "_")+'/'+version.lang+'/'+version.title.replace(/ /g, "_")+'">Full history &raquo;</a>' + 
+						(sjs.is_moderator ? "<br>" +
+							(version.status === "locked" ? 
+								'<div class="btn btn-mini lockTextButton unlock ' + version.lang + 'Version">Unlock Text</div>' :
+								'<div class="btn btn-mini lockTextButton ' + version.lang + 'Version">Lock Text</div>')
+						: "") +
 						(version.status === "locked" ? '<div class="lockedMessage"><div class="ui-icon ui-icon-locked"></div>This text has been locked to prevent further edits. If you believe this text requires further editing, please let us know by <a href="mailto:hello@sefaria.org">email</a>.</div>' : "" ) +
 					'</div>';
 		}
@@ -1974,8 +2051,9 @@ function aboutHtml(data) {
 	var versionsHtml = '';
 	var versionsLang = {};
 	var mergeSources = [];
-	if ("sources" in data) {mergeSources = mergeSources.concat(data.sources)}
-	if ("heSources" in data) {mergeSources = mergeSources.concat(data.heSources)}
+	if ("sources" in data) { mergeSources = mergeSources.concat(data.sources); }
+	if ("heSources" in data) { mergeSources = mergeSources.concat(data.heSources); }
+	data.versions = data.versions || [];
 	for (i = 0; i < data.versions.length; i++ ) {
 		var v = data.versions[i];
 		// Don't include versions used as primary en/he
@@ -2170,16 +2248,8 @@ function addSourceSuccess() {
 			
 		} else { 
 			$("#addSourceComment").addClass("inactive");
-		}				
+		}
 
-		
-		// Edit Daf Link
-		$("#editDaf").click(function() {
-			sjs.current = sjs.ref.bookData;
-			sjs.current.langMode = 'he';
-			$("#overlay").hide();
-			$("#editText").trigger("click")	
-		})
 		
 		$("#addSourceSave").text("Save Source");
 		
@@ -2282,12 +2352,257 @@ sjs.longCommentaryText = function(text, backup) {
 };
 
 
+// ---------- Reviews ---------------
+
+sjs.loadReviews = function () {
+	// Calls the server to load both english and hebrew revies as needed
+	sjs.reviews.en = null;
+	sjs.reviews.he = null;
+	if (sjs.current.text.length) { sjs.loadReview("en"); }
+	if (sjs.current.he.length)   { sjs.loadReview("he"); }
+};
+
+
+sjs.loadReview = function(lang) {
+	// Calls the server to load reviews for 'lang'
+	// Updates reviewButtson when complete
+	// If lang matches the lang of the current reviews modal, upate reviews modal content as well
+	var version = (lang == "en" ? sjs.current.versionTitle : sjs.current.heVersionTitle);
+	// If this is a merged text, do nothing. 
+	if (!version) { return; }
+	var url = sjs.current.pageRef + "/" + lang + "/" + version;
+
+	$.getJSON("/api/reviews/" + url, function(data) {
+		if ("error" in data) {
+			sjs.alert.message(data.error);
+			return;
+		}
+		sjs.reviews[data.lang] = data;
+
+		sjs.updateReviewButton(data.lang);
+		var currentLang = $("#reviewsModal").attr("data-lang") || sjs.langMode;
+		if (data.lang == currentLang) {
+			sjs.updateReviewsModal(currentLang);
+		}
+
+	});	
+};
+
+
+sjs.updateReviewButton = function(lang) {
+	// Set the counts and colors for the reviews buttons for lang
+	var data = sjs.reviews[lang];
+	if (data) {
+		$(".reviewsButton." + lang).remove();
+		var classStr = sjs.scoreToClass(data.scoreSinceLastEdit) + " " + lang;
+		// Call out unreviewed translations
+		if (data.version === "Sefaria Community Translation" && data.scoreSinceLastEdit < 0.3) {
+			classStr += " badge-error";
+		} 
+		var buttonHtml = 
+			"<div class='reviewsButton "+ classStr + "'>" +
+				(data.reviewCount ? data.reviewCount : "?") + 
+			"</div>";
+		//if (data.version === "Sefaria Community Translation") {
+		//	$(".aboutBarBox").last().append(buttonHtml);
+		//}
+		$(".version." + lang + " .historyLink").before(buttonHtml);
+	}
+}
+
+
+sjs.updateReviewsModal = function(lang) {
+	// Creates content of reviews modal with stored reviews for lang
+
+	// Don't do anything if called with "bi", let modal stay in its current language
+	if (lang === "bi") { return; } 
+
+	var data = sjs.reviews[lang];
+	if (!data) {
+		var version = (lang == "en" ? sjs.current.versionTitle : sjs.current.heVersionTitle);
+		if (!version && $("#reviewsModal").is(":visible")) {
+			sjs.alert.message("This text contains merged sections from multiple text versions. To review, please first select an individual version in the About Text Panel.");
+		}
+		return;
+	} 
+
+	// Store which language this modal is about, in case user switches to bilingual mode
+	$("#reviewsModal").attr("data-lang", lang);
+
+	// Set Title
+	var longLang = {en: "English", he: "Hebrew"}[lang];
+	var title = "Reviews of " + data.ref + ",  " + data.version + ", " + longLang;
+	$("#reviewTitle").html(title);
+
+	// Set About
+	var about = "<span class='score raty' data-raty='" + (data.scoreSinceLastEdit || "0") + "'></span>" +
+				"<span class='reviewCount'>(" + data.reviewCount + ")</span>";
+	$("#reviewAbout").html(about);
+
+	// Set list of past reviews
+	var lastEditDateAdded = false; // if a last edited date has been added to its place chronologically
+	var currentReview = null; // the already review made by user since last edit
+	if (data.reviews.length) {
+		var reviewsHtml = "";
+		for (var i = 0; i < data.reviews.length; i++) {
+			var review = data.reviews[i];
+			if (review.user == sjs._uid && !lastEditDateAdded) {
+				currentReview = review;
+			}
+			if (data.lastEdit > review.date && !lastEditDateAdded) {
+				reviewsHtml += "<div class='lastEdit'>This text was last edited " + 
+									(data.lastEdit !== null ?
+										"on " + $.datepicker.formatDate('mm/dd/yy', new Date(data.lastEdit)) : 
+										"before 01/05/2012") + " (review scores are reset from here)" +
+								"</div>";
+				lastEditDateAdded = true;
+			}
+			reviewsHtml += "<div class='review'>" + 
+									(review.user == sjs._uid ? "<span class='reviewDelete' data-id='" + review._id + "'>delete</span>": "") +
+									"<span class='reviewer'>" + review.userLink + "</span>" +
+									"<span class='reviewDate'>" + $.datepicker.formatDate('mm/dd/yy', new Date(review.date)) + "</span><br>" +
+									"<span class='reviewerScore raty' data-raty='" + review.score + "'></span>" +
+									"<span class='reviewText'>" + review.comment.replace(/\n/g, "<br>") + "</span>" +
+								"</div>";
+		}		
+	} else {
+		var reviewsHtml = "<div class='noReviews'>This text has not yet been reviewed.</div>";
+	}
+	if (!lastEditDateAdded) {
+		reviewsHtml += "<div class='lastEdit'>This text was last edited " + 
+							(data.lastEdit !== null ?
+								"on " + $.datepicker.formatDate('mm/dd/yy', new Date(data.lastEdit)) : 
+								"before 01/05/2012") + 
+						"</div>";
+	}
+	$("#reviews").html(reviewsHtml);
+
+	// Init all rating stars
+	$(".raty").each(function() {
+		var score = parseFloat($(this).attr("data-raty")) * 5;
+		var settings = $.extend({}, sjs.ratySettings, {score: score, readOnly: true, size: 14});
+		$(this).raty(settings);
+	});
+
+	// Restore a review in progress, if it exists
+	if (sjs.reviews.inProgress[sjs.getReviewKey()]) {
+		currentReview = sjs.reviews.inProgress[sjs.getReviewKey()];
+	}
+	if (currentReview) {
+		$("#reviewText").val(currentReview.comment);
+		$("#raty").raty($.extend({}, sjs.ratySettings, {score: currentReview.score * 5}));
+	} else {
+		$("#reviewText").val("");
+		$("#raty").raty(sjs.ratySettings);
+	}
+
+}
+
+
+sjs.scoreToClass = function(score) {
+	// Returns a CSS class for color coding reviews based on score. 
+
+	//if (!score)      return "badge"; // Grey
+	//if (score <= .3)  return "badge badge-error"; // Red 
+	if (score <= .3)  return "badge";               // Grey 	
+	if (score <= .7)  return "badge badge-warning"; // Yellow
+	if (score >= .7)  return "badge badge-success"; // Green
+};
+
+
+sjs.saveReview = function() {
+	// Validate form
+	if (!$("#reviewText").val()) {
+		sjs.alert.message("Please write a review message.");
+		return;
+	} else if (!$("#raty").raty("score")) {
+		sjs.alert.message("Please give a review score.");
+		return;
+	}
+
+	sjs.storeReviewInProgress();
+
+	var url = sjs.getReviewKey();
+	var review = sjs.readReview();
+	var postJSON = JSON.stringify(review);
+	sjs.alert.saving("Saving...");
+	$.post("/api/reviews/" + url, {json: postJSON}, function(data){
+		if ("error" in data) {
+			sjs.alert.message(data.error)
+		} else {
+			sjs.alert.message("Review Saved.");
+			sjs.loadReview(data.language);
+			sjs.track.event("Reviews", "Save Review", "");
+		}
+	}).fail(function() {
+		sjs.alert.message("There was an error saving your review. If the problem persists, try reloading the page.");
+	});	
+};
+
+sjs.readReview = function() {
+	var lang = $("#reviewsModal").attr("data-lang");
+	var review = {
+		comment: $("#reviewText").val(),
+		score: $("#raty").raty("score") / 5,
+		ref: sjs.current.pageRef,
+		language: lang,
+		version: lang == "en" ? sjs.current.versionTitle : sjs.current.heVersionTitle,
+	};
+	return review;
+};
+
+
+sjs.deleteReview = function(e) {
+	if (confirm("Are you sure you want to delete this review?")) {
+		var id = $(this).attr("data-id");
+		$.ajax({
+			type: "delete",
+			url:  "/api/reviews/" + id,
+			success: function(data) {
+				if ("error" in data) {
+					sjs.alert.message(data.error);
+				} else {
+					sjs.alert.message("Review deleted");
+					sjs.loadReviews();
+				}
+			},
+			error: function () {
+				sjs.alert.message("There was an error deleting this reivew. Please reload the page and try again.");
+			}
+		});
+	}
+};
+
+
+sjs.storeReviewInProgress = function() {
+	// Store the text of a review in progress for a particular ref / lang / version
+	// so it can be restored as the user change pages / languages modes.
+	var key = sjs.getReviewKey();
+	sjs.reviews.inProgress[key] = sjs.readReview();
+
+};
+
+sjs.getReviewKey = function() {
+	// Returns the URL path for current ref / lang / verion
+	var lang = sjs.langMode;
+	if (lang == "bi") {
+		lang = $("#reviewsModal").attr("data-lang");
+	}
+	if (lang == "en") {
+		var key = sjs.current.pageRef + "/en/" + sjs.current.versionTitle;
+	} else if (lang == "he") {
+		var key = sjs.current.pageRef + "/he/" + sjs.current.heVersionTitle; 
+	}
+
+	return key.replace(/ /g, "_");
+}
+
 function buildOpen(editMode) {
 	// Build modal for adding or editing a source or note
 	// Previously, this same code create modals for viewing full text of a source.
 	// if editMode, copy expanded source for editing
 	// else, build a modal for adding a new source
-	// This code a mess and shoud be rewritten from scratch. 
+	// This code is a mess and shoud be rewritten from scratch. 
 	
 	$(".open").remove();
 
@@ -2380,7 +2695,7 @@ function buildOpen(editMode) {
 		var comment = sjs.current.commentary[parseInt(id)];
 		if (comment.text && comment.he) {
 			$("#addSourceTextBox .btn.he, #addSourceTextBox .btn.en").removeClass("inactive");
-			if (sjs.current.langMode === "he") {
+			if (sjs.langMode === "he") {
 				$("#addSourceTextBox").addClass("he");
 			}
 		} else if (comment.text) {
@@ -2485,11 +2800,11 @@ function buildOpen(editMode) {
 		
 		if (this.id in {"addSourceHebrew":1, "addSourceEnglish": 1}) {
 			if (this.id == "addSourceHebrew") {
-				sjs.current.langMode = "en"; // so english will show as compare text
+				sjs.langMode = "en"; // so english will show as compare text
 				$("#language").val("he");
 				$("#newVersion").css("direction", "rtl");
 			} else {
-				sjs.current.langMode = "he";
+				sjs.langMode = "he";
 			}
 			sjs.showNewVersion();
 
@@ -2508,9 +2823,9 @@ function buildOpen(editMode) {
 		sjs.alert.saving("Looking up text...");
 		var text = $("#addSourceCitation").val().replace(/ /g, "_")
 		if ($("#addSourceTextBox").hasClass("he")) {
-			sjs.current.langMode = "he";
+			sjs.langMode = "he";
 		} else {
-			sjs.current.langMode = "en";
+			sjs.langMode = "en";
 		}
 		$.getJSON("/api/texts/" + text, sjs.editText)
 			.error(function(){ sjs.alert.message("Sorry there was an error.")});
@@ -2538,8 +2853,8 @@ sjs.makePlainText = function(text) {
 	// Turn text array into a string, separating segments with \n\n
 	// Replace empty strings in text with "..."
 
-	// TODO - This currently removes any single line breaks inside text segments,
-	// which screws things up currently but should be allowed later. 
+	// TODO - This currently removes any single line breaks inside text segments.
+	// Line breaks inside segments currently screws things up but should be allowed later. 
 	var placeholders = function(line) { return line ? line.replace(/\n/g, " ") : "..."; };
 	var text = sjs.editing.text.map(placeholders).join('\n\n');
 	return text
@@ -2556,7 +2871,7 @@ sjs.editText = function(data) {
 		sjs.editing.smallSectionName = data.sectionNames[data.sectionNames.length-1];
 		sjs.editing.bigSectionName   = data.sectionNames[data.sectionNames.length-2];
 		
-		if (sjs.current.langMode === 'en') {
+		if (sjs.langMode === 'en') {
 			sjs.editing.versionTitle = data.versionTitle;
 			sjs.editing.versionSource = data.versionSource;
 			sjs.editing.heVersionTitle = data.heVersionTitle;
@@ -2564,16 +2879,17 @@ sjs.editText = function(data) {
 			sjs.editing.text = data.text;
 			sjs.editing.he = data.he;
 			var pad = data.he ? Math.max(data.he.length - data.text.length, 0) : 0;
-		} else if (sjs.current.langMode === 'he') {
+		} else if (sjs.langMode === 'he') {
 			$("body").addClass("hebrew");
 			sjs.editing.versionTitle = data.heVersionTitle;
 			sjs.editing.versionSource = data.heVersionSource;
 			sjs.editing.text = data.he;
 			var pad = data.text ? Math.max(data.text.length - data.he.length, 0) : 0;
-		} else if (sjs.current.langMode === 'bi') {
+		} else if (sjs.langMode === 'bi') {
 			sjs.alert.message("Select a language to edit first with the language toggle in the upper right.");
 			return;
 		} else {
+			console.log("sjs.editText called with unknown value for sjs.langMode");
 			return;
 		}
 
@@ -2611,7 +2927,7 @@ sjs.editCurrent = function(e) {
 sjs.addThis = function(e) {
 	var lang = $(this).attr("data-lang");
 	if (lang) {
-		sjs.current.langMode = lang;
+		sjs.langMode = lang;
 	}
 	sjs.editCurrent(e);
 	var n = parseInt($(this).attr("data-num"))
@@ -2662,8 +2978,8 @@ sjs.newText = function(e) {
 
 sjs.showNewVersion = function() {
 	
-	sjs.editing.compareText = sjs.current.langMode == "en" ? sjs.editing.text : sjs.editing.he;
-	sjs.editing.compareLang = sjs.current.langMode;
+	sjs.editing.compareText = sjs.langMode == "en" ? sjs.editing.text : sjs.editing.he;
+	sjs.editing.compareLang = sjs.langMode;
 
 	sjs.editing.smallSectionName = sjs.editing.sectionNames[sjs.editing.sectionNames.length-1];
 	sjs.editing.bigSectionName = sjs.editing.sectionNames[sjs.editing.sectionNames.length-2];
@@ -2673,8 +2989,8 @@ sjs.showNewVersion = function() {
 	sjs._$newVersion.css("min-height", $("#newTextCompare").height())
 		.focus();
 
-	var title = sjs.current.langMode == "en" ? sjs.editing.versionTitle : sjs.editing.heVersionTitle;
-	var source = sjs.current.langMode == "en" ? sjs.editing.versionSource : sjs.editing.heVersionSource;
+	var title = sjs.langMode == "en" ? sjs.editing.versionTitle : sjs.editing.heVersionTitle;
+	var source = sjs.langMode == "en" ? sjs.editing.versionSource : sjs.editing.heVersionSource;
 	$(".compareTitle").text(title);
 	$(".compareSource").text(source);
 
@@ -2979,9 +3295,9 @@ sjs.readNewIndex = function() {
 	index.titleVariants = $("#textTitleVariants").tagit("assignedTags")
 	index.titleVariants.unshift(index.title);
 	var cat = $("#textCategory").val();
-	// Don't allow category updates to Tanach, Mishna or Talmud
+	// Don't allow category updates to Tanach, Mishnah or Talmud
 	// HACK to deal with incomplete handling on subcategories 
-	if (cat in {"Tanach": 1, "Mishna": 1, "Talmud": 1}) {
+	if (cat in {"Tanach": 1, "Mishnah": 1, "Talmud": 1}) {
 		index.categories = sjs.current.categories || "locked";
 	} else {
 		index.categories = (cat == "Other" ? [$("#otherCategory").val()] : [cat]);
@@ -3027,7 +3343,7 @@ sjs.validateIndex = function(index) {
 		return false;
 	}
 	if ("categories" in index && index.categories === "locked") {
-		sjs.alert.message("Adding new texts to Tanach, Mishna and Talmud is currently locked. Please post to our Forum if you need to add a text to these categories.")
+		sjs.alert.message("Adding new texts to Tanach, Mishnah and Talmud is currently locked. Please post to our Forum if you need to add a text to these categories.")
 		return false;
 	}
 
@@ -3110,7 +3426,9 @@ sjs.saveNewIndex = function(index) {
 			sjs.clearNewIndex();
 
 		}
-	});			
+	}).fail( function(xhr, textStatus, errorThrown) {
+        sjs.alert.message("Unfortunately, there was an error saving this text information. Please try again or try reloading this page.")
+    });
 	
 };
 
@@ -3123,7 +3441,7 @@ sjs.translateText = function(data) {
 		return;
 	} 
 	sjs.editing = data;
-	sjs.current.langMode = 'he';
+	sjs.langMode = 'he';
 	if (data.sectionNames.length === data.sections.length) {
 		sjs.editing.offset = data.sections[data.sections.length - 1];
 	}
@@ -3307,9 +3625,11 @@ function saveSource(source) {
 		} else if (data) {
 			updateSources(data);
 		} else {
-			sjs.alert.message("Sorry, there was a problem saving your source");
+			sjs.alert.message("Sorry, there was a problem saving your source.");
 		}
-	})
+	}).fail( function(xhr, textStatus, errorThrown) {
+        sjs.alert.message("Unfortunately, there was an error saving this source. Please try again or try reloading this page.")
+    });
 }
 
 
@@ -3567,7 +3887,9 @@ function syncTextGroups($target) {
 
 
 function readNewVersion() {
-	
+	// Returns on object corresponding to a text segment from the text fields
+	// in the DOM.
+	// Called "new version" by legacy when a text was referred to as a 'version'.
 	var version = {};
 
 	version.postUrl = sjs.editing.book.replace(/ /g, "_");
@@ -3588,9 +3910,16 @@ function readNewVersion() {
 	}
 
 	var text = $("#newVersion").val();
-	var verses = text.split(/\n\n+/g);
+	if (text) {
+		var verses = text.split(/\n\n+/g);
+	} else {
+		// Avoid treating an empty textarea as [""] which is interrpreted as
+		// 'a first segment exists, but we don't have it'. This should actually
+		// be saved as empty.
+		var verses = [];
+	}
 	for (var i=0; i < verses.length; i++) {
-		// Treat "..." as empty
+		// Treat "..." as empty placeholder ('this segment exists, but we don't have it')
 		verses[i] = (verses[i] === "..." ? "" : verses[i]);
 	}
 	if (sjs.editing.offset) {
@@ -3615,7 +3944,7 @@ function readNewVersion() {
 
 	
 function saveText(text) {
- 	
+ 	// Posts the obect 'text' to save via the texts API.
  	var ref = text.postUrl;
  	delete text["postUrl"];
  	
@@ -3640,7 +3969,9 @@ function saveText(text) {
 
 
 		}
-	})
+	}).fail( function(xhr, textStatus, errorThrown) {
+        sjs.alert.message("Unfortunately, there was an error saving this text. Please try again or try reloading this page.")
+    });
 }
 
 
@@ -3714,6 +4045,17 @@ function setScrollMap() {
 	
 	return sjs._scrollMap;
 }
+
+sjs.searchInsteadOfNav = function (query) {
+	// Displays an option under the search box to search for 'query' rather
+	// than treat it as a navigational query.
+	var html = "<div id='searchInsteadOfNavPrompt'>" + 
+					"Search for '<a href='/search?q=" + query + "'>" + query + "</a>' instead." +
+				"</div>";
+	$("#searchInsteadOfNavPrompt").remove();
+	$(html).appendTo("body").css({left: $("#goto").offset().left});
+	setTimeout('$("#searchInsteadOfNavPrompt").remove();', 4000);
+};
 
 
 function hardRefresh(ref) {

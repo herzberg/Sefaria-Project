@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
+"""
+texts.py -- backend core for manipulating texts, refs (citations), links, notes and text index records.
 
-import sys
+MongoDB collections handled in this file: index, texts, links, notes
+"""
 import os
 import re
 import copy
-import pymongo
-import simplejson as json
-from datetime import datetime
 from pprint import pprint
 
 # To allow these files to be run directly from command line (w/o Django shell)
@@ -14,27 +14,27 @@ os.environ['DJANGO_SETTINGS_MODULE'] = "settings"
 
 from django.core.cache import cache
 from bson.objectid import ObjectId
-import operator
 import bleach
 
-from settings import *
-from counts import *
+from util import *
 from history import *
-from summaries import *
-from search import index_text
+from database import db
 from hebrew import encode_hebrew_numeral, decode_hebrew_numeral
+
+from search import add_ref_to_index_queue
+import summaries
 
 
 # HTML Tag whitelist for sanitizing user submitted text
 ALLOWED_TAGS = ("i", "b", "u", "strong", "em", "big", "small")
 
-connection = pymongo.Connection(MONGO_HOST)
-db = connection[SEFARIA_DB]
-if SEFARIA_DB_USER and SEFARIA_DB_PASSWORD:
-	db.authenticate(SEFARIA_DB_USER, SEFARIA_DB_PASSWORD)
+# Simple caches for indices, parsed refs, table of contents and texts list
+indices = {}
+parsed = {}
+toc_cache = None
+texts_titles_cache = None
+texts_titles_json = None
 
-parsed = cache.get("parsed", {})
-indices = cache.get("indices", {})
 
 def return_copy(func):
 	"""
@@ -74,7 +74,7 @@ def get_index(book):
 
 	# Try matching "Commentator on Text" e.g. "Rashi on Genesis"
 	commentators = db.index.find({"categories.0": "Commentary"}).distinct("titleVariants")
-	books = db.index.find({"categories.0": {"$in": ["Tanach", "Talmud"]}}).distinct("titleVariants")
+	books = db.index.find({"categories.0": {"$in": ["Tanach", "Mishnah", "Talmud"]}}).distinct("titleVariants")
 
 	commentatorsRe = "^(" + "|".join(commentators) + ") on (" + "|".join(books) +")$"
 	match = re.match(commentatorsRe, book)
@@ -121,8 +121,8 @@ def merge_translations(text, sources):
 			result, source = merge_translations(map(remove_nones, translations), sources)
 			results.append(result)
 			# NOTE - the below flattens the sources list, so downstream code can always expect
-			# a one dimensional list, but in so doing the mapping of source name to segments
-			# is lost of merged texts of depth > 2 (this mapping is not currenly used in general)
+			# a one dimensional list, but in so doing the mapping of source names to segments
+			# is lost for merged texts of depth > 2 (this mapping is not currenly used in general)
 			result_sources += source
 		return [results, result_sources]
 
@@ -133,7 +133,7 @@ def merge_translations(text, sources):
 	text = []
 	text_sources = []
 	for verses in merged:
-		# Look for the first non empty version (which will be the oldest)
+		# Look for the first non empty version (which will be the oldest, or one with highest priority)
 		index, value = 0, 0
 		for i, version in enumerate(verses):
 			if version:
@@ -331,17 +331,8 @@ def get_text(ref, context=1, commentary=True, version=None, lang=None, pad=True)
 		r["heSources"] = heRef.get("sources")
 
 	# find commentary on this text if requested
-	if commentary:
-		if r["type"] == "Talmud":
-			searchRef = r["book"] + " " + section_to_daf(r["sections"][0])
-		elif r["type"] == "Commentary" and r["commentaryCategories"][0] == "Talmud":
-			searchRef = r["book"] + " " + section_to_daf(r["sections"][0])
-			searchRef += (".%d" % r["sections"][1]) if len(r["sections"]) > 1 else ""
-		else:
-			sections = ["%s" % s for s in r["sections"][:len(r["sectionNames"])-1]]
-			if not len(sections) and len(r["sectionNames"]) > 1:
-				sections = ["1"]
-			searchRef = ".".join([r["book"]] + sections)
+	if commentary:		
+		searchRef = norm_ref(ref, pad=True, context=context)
 		links = get_links(searchRef)
 		r["commentary"] = links if "error" not in links else []
 
@@ -359,14 +350,15 @@ def get_text(ref, context=1, commentary=True, version=None, lang=None, pad=True)
 	# replace ints with daf strings (3->"2a") if text is Talmud or commentary on Talmud
 	if r["type"] == "Talmud" or r["type"] == "Commentary" and r["commentaryCategories"][0] == "Talmud":
 		daf = r["sections"][0]
-		r["sections"][0] = section_to_daf(daf)
+		r["sections"] = [section_to_daf(daf)] + r["sections"][1:]
 		r["title"] = r["book"] + " " + r["sections"][0]
 		if "heTitle" in r:
 			r["heBook"] = r["heTitle"]
 			r["heTitle"] = r["heTitle"] + " " + section_to_daf(daf, lang="he")
 		if r["type"] == "Commentary" and len(r["sections"]) > 1:
 			r["title"] = "%s Line %d" % (r["title"], r["sections"][1])
-		if "toSections" in r: r["toSections"][0] = r["sections"][0]
+		if "toSections" in r: 
+			r["toSections"] = [r["sections"][0]] + r["toSections"][1:]
 
 	elif r["type"] == "Commentary":
 		d = len(r["sections"]) if len(r["sections"]) < 2 else 2
@@ -379,7 +371,7 @@ def is_spanning_ref(pRef):
 	"""
 	Returns True if the parsed ref (pRef) spans across text sections.
 	(where "section" is the second lowest segment level, e.g., "Chapter", "Daf")
-	Shabbat 13a-b - True, Shabbat 13:3-14 - False
+	Shabbat 13a-b - True, Shabbat 13a:3-14 - False
 	Job 4:3-5:3 - True, Job 4:5-18 - False
 	"""
 	depth = pRef["textDepth"]
@@ -410,7 +402,7 @@ def get_spanning_text(pRef):
 	TODO properly track version names and lists which may differ across sections
 	"""
 	refs = split_spanning_ref(pRef)
-	text, he = [], []
+	result, text, he = {}, [], []
 	for ref in refs:
 		result = get_text(ref, context=0, commentary=False)
 		text.append(result["text"])
@@ -449,14 +441,36 @@ def split_spanning_ref(pRef):
 		section_pRef["toSections"] = section_pRef["sections"]
 		refs.append(make_ref(section_pRef))
 
-	# add segment specificity to beginning
-	last_segment = get_segment_count_for_ref(refs[0])
-	refs[0] = "%s:%d-%d" % (refs[0], pRef["sections"][-1], last_segment)
+	if len(pRef["sections"]) == depth:
+		# add specificity only if it exists in the original ref
+		
+		# add segment specificity to beginning
+		last_segment = get_segment_count_for_ref(refs[0])
+		refs[0] = "%s:%d-%d" % (refs[0], pRef["sections"][-1], last_segment)
 
-	# add segment specificity to end
-	refs[-1] = "%s:1-%d" % (refs[-1], pRef["toSections"][-1])
+		# add segment specificity to end
+		refs[-1] = "%s:1-%d" % (refs[-1], pRef["toSections"][-1])
 
 	return refs
+
+
+def list_refs_in_range(ref):
+	"""
+	Returns a list of refs corresponding to each point in the range of refs
+	"""
+	pRef = parse_ref(ref)
+	if "error" in pRef:
+		return pRef
+
+	results = []
+	sections, toSections = pRef["sections"], pRef["toSections"]
+	pRef["sections"] = pRef["toSections"] = sections[:]
+
+	for section in range(sections[-1], toSections[-1]+1):
+		pRef["sections"][-1] = section
+		results.append(make_ref(pRef))
+
+	return results
 
 
 def get_segment_count_for_ref(ref):
@@ -474,6 +488,9 @@ def get_version_list(ref):
 	Returns a list of available text versions matching 'ref'
 	"""
 	pRef = parse_ref(ref)
+	if "error" in pRef:
+		return []
+
 	skip = pRef["sections"][0] - 1 if len(pRef["sections"]) else 0
 	limit = 1
 	versions = db.texts.find({"title": pRef["book"]}, {"chapter": {"$slice": [skip, limit]}})
@@ -492,18 +509,24 @@ def get_version_list(ref):
 
 	return vlist
 
+
 def make_ref_re(ref):
 	"""
 	Returns a string for a Regular Expression which will find any refs that match
-	'ref' exactly, or more specific that 'ref'
+	'ref' exactly, or more specificly than 'ref'
 	E.g., "Genesis 1" yields an RE that match "Genesis 1" and "Genesis 1:3"
 	"""
 	pRef = parse_ref(ref)
-	reRef = "^%s$|^%s\:" % (ref, ref)
-	if len(pRef["sectionNames"]) == 1 and len(pRef["sections"]) == 0:
-		reRef += "|^%s \d" % ref
+	patterns = []
+	refs = list_refs_in_range(ref) if "-" in ref else [ref]
 
-	return reRef
+	for ref in refs:
+		patterns.append("%s$" % ref) # exact match
+		patterns.append("%s:" % ref) # more granualar, exact match followed by :
+		if len(pRef["sectionNames"]) == 1 and len(pRef["sections"]) == 0:
+			patterns.append("%s \d" % ref) # special case for extra granularity following space 
+
+	return "^(%s)" % "|".join(patterns)
 
 
 def get_links(ref, with_text=True):
@@ -514,7 +537,7 @@ def get_links(ref, with_text=True):
 	"""
 	links = []
 	nRef = norm_ref(ref)
-	reRef = make_ref_re(ref)
+	reRef = make_ref_re(nRef)
 
 	# for storing all the section level texts that need to be looked up
 	texts = {}
@@ -527,9 +550,12 @@ def get_links(ref, with_text=True):
 		pos = 0 if re.match(reRef, link["refs"][0]) else 1
 		com = format_link_for_client(link, nRef, pos, with_text=False)
 
+		# Rather than getting text with each link, walk through all links here,
+		# caching text so that redudant DB calls can be minimized
 		if with_text and "error" not in com:
 			top_ref = top_section_ref(com["ref"])
 			pRef = parse_ref(com["ref"])
+
 			# Lookup and save top level text, only if we haven't already
 			if top_ref not in texts:
 				texts[top_ref] = get_text(top_ref, context=0, commentary=False, pad=False)
@@ -648,6 +674,44 @@ def format_note_for_client(note):
 	return com
 
 @return_copy
+def memoize_parse_ref(func):
+	"""
+	Decorator for parse_ref to cache results in memory
+	Appends '|NOPAD' to the ref used as the dictionary key for 'parsed' to cache
+	results that have pad=False.
+	"""
+	def memoized_parse_ref(ref, pad=True):
+		try:
+			ref = ref.decode('utf-8').replace(u"–", "-").replace(":", ".").replace("_", " ")
+		except UnicodeEncodeError, e:
+			return {"error": "UnicodeEncodeError: %s" % e}
+		except AttributeError, e:
+			return {"error": "AttributeError: %s" % e}
+
+		try:
+			# capitalize first letter (don't title case all to avoid e.g., "Song Of Songs")
+			ref = ref[0].upper() + ref[1:]
+		except IndexError:
+			pass
+
+		#parsed is the cache for parse_ref
+		global parsed
+		if ref in parsed and pad:
+			return copy.copy(parsed[ref])
+		if "%s|NOPAD" % ref in parsed and not pad:
+			return copy.copy(parsed["%s|NOPAD" % ref])
+
+		pRef = func(ref, pad)
+		if pad:
+			parsed[ref] = copy.copy(pRef)
+		else:
+			parsed["%s|NOPAD" % ref] = copy.copy(pRef)
+
+		return pRef
+	return memoized_parse_ref
+
+
+@memoize_parse_ref
 def parse_ref(ref, pad=True):
 	"""
 	Take a string reference (e.g. 'Job.2:3-3:1') and returns a parsed dictionary of its fields
@@ -665,32 +729,16 @@ def parse_ref(ref, pad=True):
 		* next, prev - an dictionary with the ref and labels for the next and previous sections
 		* categories - an array of categories for this text
 		* type - the highest level category for this text
+
+
+	todo: handle comma in refs like: "Me'or Einayim, 24"
 	"""
-	try:
-		ref = ref.decode('utf-8').replace(u"–", "-").replace(":", ".").replace("_", " ")
-	except UnicodeEncodeError, e:
-		return {"error": "UnicodeEncodeError: %s" % e}
-	except AttributeError, e:
-		return {"error": "AttributeError: %s" % e}
-
-	try:
-		# capitalize first letter (don't title case all to avoid e.g., "Song Of Songs")
-		ref = ref[0].upper() + ref[1:]
-	except IndexError:
-		pass
-
-	global parsed
-	if ref in parsed and pad:
-		return parsed[ref]
-
 	pRef = {}
 
 	# Split into range start and range end (if any)
 	toSplit = ref.split("-")
 	if len(toSplit) > 2:
 		pRef["error"] = "Couldn't understand ref (too many -'s)"
-		parsed[ref] = pRef
-		cache.set("parsed", parsed)
 		return pRef
 
 	# Get book
@@ -705,7 +753,6 @@ def parse_ref(ref, pad=True):
 		bcv.insert(1, pRef["book"][p+1:])
 		pRef["book"] = pRef["book"][:p]
 
-
 	# Try looking for a stored map (shorthand)
 	shorthand = db.index.find_one({"maps": {"$elemMatch": {"from": pRef["book"]}}})
 	if shorthand:
@@ -713,30 +760,24 @@ def parse_ref(ref, pad=True):
 			if shorthand["maps"][i]["from"] == pRef["book"]:
 				# replace the shorthand in ref with its mapped value and recur
 				to = shorthand["maps"][i]["to"]
-				if ref == to: ref = to
-				else:
+				if ref != to:
 					ref = ref.replace(pRef["book"]+" ", to + ".")
 					ref = ref.replace(pRef["book"], to)
 				parsedRef = parse_ref(ref)
 				d = len(parse_ref(to, pad=False)["sections"])
 				parsedRef["shorthand"] = pRef["book"]
 				parsedRef["shorthandDepth"] = d
-				parsed[ref] = parsedRef
-				cache.set("parsed", parsed)
+
 				return parsedRef
 
 	# Find index record or book
 	index = get_index(pRef["book"])
 
 	if "error" in index:
-		parsed[ref] = index
-		cache.set("parsed", parsed)
 		return index
 
 	if index["categories"][0] == "Commentary" and "commentaryBook" not in index:
-		parsed[ref] = {"error": "Please specify a text that %s comments on." % index["title"]}
-		cache.set("parsed", parsed)
-		return parsed[ref]
+		return {"error": "Please specify a text that %s comments on." % index["title"]}
 
 	pRef["book"] = index["title"]
 	pRef["type"] = index["categories"][0]
@@ -750,10 +791,7 @@ def parse_ref(ref, pad=True):
 		pRef["ref"] = ref
 		result = subparse_talmud(pRef, index, pad=pad)
 		result["ref"] = make_ref(pRef)
-		if pad:
-			# only cache padded versions
-			parsed[ref] = result
-			cache.set("parsed", parsed)
+
 		return result
 
 	# Parse section numbers
@@ -789,8 +827,7 @@ def parse_ref(ref, pad=True):
 	if "length" in index and len(pRef["sections"]):
 		if pRef["sections"][0] > index["length"]:
 			result = {"error": "%s only has %d %ss." % (pRef["book"], index["length"], pRef["sectionNames"][0])}
-			parsed[ref] = result
-			cache.set("parsed", parsed)
+
 			return result
 
 	if pRef["categories"][0] == "Commentary" and "commentaryBook" not in pRef:
@@ -799,11 +836,8 @@ def parse_ref(ref, pad=True):
 
 	pRef["next"] = next_section(pRef)
 	pRef["prev"] = prev_section(pRef)
+	pRef["ref"]  = make_ref(pRef)
 
-	pRef["ref"] = make_ref(pRef)
-	if pad:
-		parsed[ref] = pRef
-		cache.set("parsed", parsed)
 	return pRef
 
 
@@ -826,9 +860,10 @@ def subparse_talmud(pRef, index, pad=True):
 	pRef["sections"] = []
 	if len(bcv) == 1 and pad:
 		# Set the daf to 2a if pad and none specified
-		daf = 2
+		daf = 2 if "Bavli" in pRef["categories"] else 1
 		amud = "a"
-		pRef["sections"].append(3)
+		section = 3 if "Bavli" in pRef["categories"] else 1
+		pRef["sections"].append(section)
 
 	elif len(bcv) > 1:
 		daf = bcv[1]
@@ -899,15 +934,15 @@ def subparse_talmud(pRef, index, pad=True):
 			pRef["next"] = "%s %s:%d" % (pRef["book"], daf, line + 1)
 
 	# Set previous daf, or previous line for commentary on daf
-	if pRef["type"] == "Commentary" or pRef["sections"][0] > 3: # three because first page is '2a' = 3
-		if pRef["type"] == "Talmud":
-			prevDaf = section_to_daf(pRef["sections"][0] - 1)
-			pRef["prev"] = "%s %s" % (pRef["book"], prevDaf)
-		elif pRef["type"] == "Commentary":
-			daf = section_to_daf(pRef["sections"][0])
-			line = pRef["sections"][1] if len(pRef["sections"]) > 1 else 1
-			if line > 1:
-				pRef["prev"] = "%s %s:%d" % (pRef["book"], daf, line - 1)
+	first_page = 3 if "Bavli" in pRef["categories"] else 1 # bavli starts on 2a (3), Yerushalmi on 1a (1)
+	if pRef["type"] == "Talmud" and pRef["sections"][0] > first_page:
+		prevDaf = section_to_daf(pRef["sections"][0] - 1)
+		pRef["prev"] = "%s %s" % (pRef["book"], prevDaf)
+	elif pRef["type"] == "Commentary":
+		daf = section_to_daf(pRef["sections"][0])
+		line = pRef["sections"][1] if len(pRef["sections"]) > 1 else 1
+		if line > 1:
+			pRef["prev"] = "%s %s:%d" % (pRef["book"], daf, line - 1)
 
 	return pRef
 
@@ -1115,6 +1150,25 @@ def top_section_ref(ref):
 	return make_ref(pRef)
 
 
+def section_level_ref(ref):
+	"""
+	Returns a ref which corresponds to the text section which includes 'ref'
+	(where 'section' is one level above the terminal 'segment' - e.g., "Chapter", "Daf" etc)
+
+	If 'ref' is already at the section level or above, ref is returned unchanged.
+
+	e.g., "Job 5:6" -> "Job 5", "Rashi on Genesis 1:2:3" -> "Rashi on Genesis 1:2"
+	"""
+	pRef = parse_ref(ref, pad=True)
+	if "error" in pRef:
+		return pRef
+	
+	pRef["sections"] = pRef["sections"][:pRef["textDepth"]-1]
+	pRef["toSections"] = pRef["toSections"][:pRef["textDepth"]-1]
+
+	return make_ref(pRef)
+
+
 def save_text(ref, text, user, **kwargs):
 	"""
 	Save a version of a text named by ref.
@@ -1122,7 +1176,7 @@ def save_text(ref, text, user, **kwargs):
 	text is a dict which must include attributes to be stored on the version doc,
 	as well as the text itself,
 
-	Returns saved JSON on ok or error.
+	Returns indication of success of failure.
 	"""
 	# Validate Ref
 	pRef = parse_ref(ref, pad=False)
@@ -1146,7 +1200,8 @@ def save_text(ref, text, user, **kwargs):
 	if existing:
 		# Have this (book / version / language)
 
-		if existing.get("status", "") == "locked":
+		# Only allow staff to edit locked texts
+		if existing.get("status", "") == "locked" and not is_user_staff(user): 
 			return {"error": "This text has been locked against further edits."}
 
 		# Pad existing version if it has fewer chapters
@@ -1262,13 +1317,13 @@ def save_text(ref, text, user, **kwargs):
 
 	# count available segments of text
 	if kwargs.get("count_after", True):
-		update_summaries_on_change(pRef["book"])
+		summaries.update_summaries_on_change(pRef["book"])
 
-	# index this text for search
+	# Add this text to a queue to be indexed for search
 	if SEARCH_INDEX_ON_SAVE and kwargs.get("index_after", True):
-		index_text(ref)
+		add_ref_to_index_queue(ref, response["versionTitle"], response["language"])
 
-	return response
+	return {"status": "ok"}
 
 
 def merge_text(a, b):
@@ -1304,6 +1359,22 @@ def validate_text(text, ref):
 	return {"status": "ok"}
 
 
+
+def set_text_version_status(title, lang, version, status=None):
+	"""
+	Sets the status field of an existing text version. 
+	"""
+	title   = title.replace("_", " ")
+	version = version.replace("_", " ")
+	text = db.texts.find_one({"title": title, "language": lang, "versionTitle": version})
+	if not text:
+		return {"error": "Text not found: %s, %s, %s" % (title, lang, version)}
+
+	text["status"] = status
+	db.texts.save(text)
+	return {"status": "ok"}
+
+
 def sanitize_text(text):
 	"""
 	Clean html entites of text, remove all tags but those allowed in ALLOWED_TAGS.
@@ -1319,7 +1390,7 @@ def sanitize_text(text):
 	return text
 
 
-def save_link(link, user):
+def save_link(link, user, **kwargs):
 	"""
 	Save a new link to the DB. link should have:
 		- refs - array of connected refs
@@ -1329,8 +1400,10 @@ def save_link(link, user):
 	if not validate_link(link):
 		return {"error": "Error validating link."}
 
-
 	link["refs"] = [norm_ref(link["refs"][0]), norm_ref(link["refs"][1])]
+
+	if not validate_link(link):
+		return {"error": "Error normalizing link."}
 
 	if "_id" in link:
 		# editing an existing link
@@ -1346,7 +1419,7 @@ def save_link(link, user):
 			objId = None
 
 	db.links.save(link)
-	record_obj_change("link", {"_id": objId}, link, user)
+	record_obj_change("link", {"_id": objId}, link, user, **kwargs)
 
 	# Delete cache of texts on either side of the link
 	delete_get_text_cache(link["refs"][0], delete_linked=False)
@@ -1473,6 +1546,7 @@ def save_index(index, user, **kwargs):
 	Save an index record to the DB.
 	Index records contain metadata about texts, but not the text itself.
 	"""
+	global indices, texts_titles_cache, texts_titles_json
 	index = norm_index(index)
 
 	validation = validate_index(index)
@@ -1491,7 +1565,6 @@ def save_index(index, user, **kwargs):
 		del index["oldTitle"]
 	else:
 		old_title = None
-
 
 	# Merge with existing if any to preserve serverside data
 	# that isn't visibile in the client (like chapter counts)
@@ -1513,19 +1586,42 @@ def save_index(index, user, **kwargs):
 
 	# now save with normilzed maps
 	db.index.save(index)
-	
-	reset_texts_cache()
-	update_summaries_on_change(title, old_ref=old_title, recount=bool(old_title)) # only recount if the title changed
+
+	# invalidate in-memory cache
+	for variant in index["titleVariants"]:
+		if variant in indices:
+			del indices[variant]
+	texts_titles_cache = texts_titles_json = None
+
+	summaries.update_summaries_on_change(title, old_ref=old_title, recount=bool(old_title)) # only recount if the title changed
 
 	del index["_id"]
 	return index
+
+
+def update_index(index, user, **kwargs):
+	"""
+	Update an existing index record with the fields in index.
+	index must include a title to find an existing record.
+	"""
+	if "title" not in index:
+		return {"error": "'title' field is required to update an index."}
+
+	# Merge with existing
+	existing = db.index.find_one({"title": index["title"]})
+	if existing:
+		index = dict(existing.items() + index.items())
+	else:
+		return {"error": "No existing index record found to update for %s" % index["title"]}
+
+	return save_index(index, user, **kwargs)
 
 
 def validate_index(index):
 	# Required Keys
 	for key in ("title", "titleVariants", "categories", "sectionNames"):
 		if not key in index:
-			return {"error": "Text index is missing a required field"}
+			return {"error": "Text index is missing a required field: %s" % key}
 
 	# Keys that should be non empty lists
 	for key in ("categories", "sectionNames"):
@@ -1582,12 +1678,17 @@ def update_text_title(old, new):
 		* titles in top text counts
 		* reset indices and parsed cache
 	"""
-	# this could be more targeted
-	global indices, parsed
-	indices = {}
-	parsed = {}
-	cache.delete("indices")
-	cache.delete("parsed")
+	index = get_index(old)
+	if "error" in index:
+		return index
+
+	# Special case if old is a Commentator name
+	if index["categories"][0] == "Commentary" and "commentaryBook" not in index:
+		commentary_text_titles = get_commentary_texts_list()
+		old_titles = [title for title in commentary_text_titles if title.find(old) == 0]
+		old_new = [(title, title.replace(old, new, 1)) for title in old_titles]
+		for pair in old_new:
+			update_text_title(pair[0], pair[1])
 
 	update_title_in_index(old, new)
 	update_title_in_texts(old, new)
@@ -1595,6 +1696,10 @@ def update_text_title(old, new):
 	update_title_in_notes(old, new)
 	update_title_in_history(old, new)
 	update_title_in_counts(old, new)
+
+	global indices, parsed
+	indices = {}
+	parsed = {}
 
 
 def update_title_in_index(old, new):
@@ -1634,10 +1739,7 @@ def update_title_in_history(old, new):
 		h["ref"] = re.sub(pattern, new, h["ref"])
 		db.history.save(h)
 
-	index_hist = db.history.find({"title": old})
-	for i in index_hist:
-		i["title"] = new
-		db.history.save(i)
+	db.history.update({"title": old}, {"$set": {"title": new}}, upsert=False, multi=True)
 
 	link_hist = db.history.find({"new": {"refs": {"$regex": pattern}}})
 	for h in link_hist:
@@ -1663,6 +1765,64 @@ def update_title_in_counts(old, new):
 		db.counts.save(c)
 
 
+def update_version_title(old, new, text_title, language):
+	"""
+	Rename a text version title, including versions in history
+	'old' and 'new' are the version title names.
+	"""
+	query = {
+		"title": text_title,
+		"versionTitle": old,
+		"language": language
+	}
+	db.texts.update(query, {"$set": {"versionTitle": new}}, upsert=False, multi=True)
+
+	update_version_title_in_history(old, new, text_title, language)
+
+
+def update_version_title_in_history(old, new, text_title, language):
+	"""
+	Rename a text version title in history records
+	'old' and 'new' are the version title names.
+	"""
+	query = {
+		"ref": {"$regex": r'^%s(?= \d)' % text_title},
+		"version": old,
+		"language": language,
+	}
+	db.history.update(query, {"$set": {"version": new}}, upsert=False, multi=True)
+
+
+def merge_text_versions(version1, version2, text_title, language):
+	"""
+	Merges the contents of two distinct text versions.
+	version2 is merged into version1 then deleted.  
+	Preference is giving to version1 - if both versions contain content for a given segment,
+	only the content of version1 will be retained.
+
+	History entries are rewritten for version2. 
+	NOTE: the history of that results will be incorrect for any case where the content of
+	version2 is overwritten - the history of those overwritten edits will remain.
+	To end with a perfectly accurate history, history items for segments which have been overwritten
+	would need to be identified and deleted. 
+	"""
+	v1 = db.texts.find_one({"title": text_title, "versionTitle": version1, "language": language})
+	if not v1:
+		return {"error": "Version not found: %s" % version1 }
+	v2 = db.texts.find_one({"title": text_title, "versionTitle": version2, "language": language})
+	if not v2:
+		return {"error": "Version not found: %s" % version2 }
+
+	merged_text, sources = merge_translations([v1["chapter"], v2["chapter"]], [version1, version2])
+
+	v1["chapter"] = merged_text
+	db.texts.save(v1)
+
+	update_version_title_in_history(version2, version1, text_title, language)
+
+	db.texts.remove(v2)
+
+
 def rename_category(old, new):
 	"""
 	Walk through all index records, replacing every category instance
@@ -1670,10 +1830,10 @@ def rename_category(old, new):
 	"""
 	indices = db.index.find({"categories": old})
 	for i in indices:
-		i["categories"] = [new if cat == old else old for cat in i["categories"]]
+		i["categories"] = [new if cat == old else cat for cat in i["categories"]]
 		db.index.save(i)
 
-	update_summaries()
+	summaries.update_summaries()
 
 
 def resize_text(title, new_structure, upsize_in_place=False):
@@ -1720,9 +1880,8 @@ def resize_text(title, new_structure, upsize_in_place=False):
 	# TODO Rewrite any existing Links
 	# TODO Rewrite any exisitng History items
 
+	summaries.update_summaries_on_change(title)
 	reset_texts_cache()
-	update_counts(title)
-	update_summaries_on_change(title)
 
 	return True
 
@@ -1793,6 +1952,8 @@ def reset_texts_cache():
 	cache.delete("text_titles")
 	cache.delete("text_titles_json")
 	delete_template_cache('texts_list')
+	delete_template_cache('leaderboards')
+
 
 
 def get_refs_in_text(text):
@@ -1800,6 +1961,8 @@ def get_refs_in_text(text):
 	Returns a list of valid refs found within text.
 	"""
 	titles = get_titles_in_text(text)
+	if not titles:
+		return []
 	reg = "\\b(?P<ref>"
 	reg += "(" + "|".join([re.escape(title) for title in titles]) + ")"
 	reg += " \d+([ab])?([ .:]\d+)?([ .:]\d+)?(-\d+([ab])?([ .:]\d+)?)?" + ")\\b"
@@ -1877,89 +2040,6 @@ def get_text_categories():
 	return db.index.find().distinct("categories")
 
 
-def get_texts_summaries_for_category(category):
-	"""
-	Returns the list of texts records in the table of contents corresponding to "category".
-	"""
-	toc = get_toc()
-	summary = []
-	for cat in toc:
-		if cat["category"] == category:
-			if "category" in cat["contents"][0]:
-				for cat2 in cat["contents"]:
-					summary += cat2["contents"]
-			else:
-				summary += cat["contents"]
-
-			return summary
-
-	return []
-
-
-def generate_refs_list(query={}):
-	"""
-	Generate a list of refs to all available sections.
-	"""
-	refs = []
-	counts = db.counts.find(query)
-	for c in counts:
-		if "title" not in c:
-			continue # this is a category count
-
-		i = get_index(c["title"])
-		if ("error" in i):
-			# If there is not index record to match the count record,
-			# the count should be removed.
-			db.counts.remove(c)
-			continue
-		title = c["title"]
-		he = list_from_counts(c["availableTexts"]["he"])
-		en = list_from_counts(c["availableTexts"]["en"])
-		sections = union(he, en)
-		for n in sections:
-			if i["categories"][0] == "Talmud":
-				n = section_to_daf(int(n))
-			if "commentaryCategories" in i and i["commentaryCategories"][0] == "Talmud":
-				split = n.split(":")
-				n = ":".join([section_to_daf(int(n[0]))] + split[1:])
-			ref = "%s %s" % (title, n) if n else title
-			refs.append(ref)
-
-	return refs
-
-
-def list_from_counts(count, pre=""):
-	"""
-	Recursive function to transform a count array (a jagged array counting
-	how many versions of each text segment are availble) into a list of
-	available sections numbers.
-
-	A section is considered available if at least one of its segments is available.
-
-	E.g., [[1,1],[0,1]]	-> [1,2]
-	      [[0,0], [1,0]] -> [2]
-		  [[[1,2], [0,1]], [[0,0], [1,0]]] -> [1:1, 1:2, 2:2]
-	"""
-	urls = []
-
-	if not count:
-		return urls
-
-	elif isinstance(count[0], int):
-		# The count we're looking at represents a section
-		# List it in urls if it not all empty
-		if not all(v == 0 for v in count):
-			urls.append(pre)
-			return urls
-
-	for i, c in enumerate(count):
-		if isinstance(c, list):
-			p = "%s:%d" % (pre, i+1) if pre else str(i+1)
-			urls += list_from_counts(c, pre=p)
-
-	return urls
-
-
 def get_commentary_texts_list():
 	"""
 	Returns a list of text titles that exist in the DB which are commentaries.
@@ -1991,12 +2071,11 @@ def grab_section_from_text(sections, text, toSections=None):
 		else:
 			return text[ sections[0]-1 : toSections[0]-1 ]
 
-	except IndexError, TypeError:
+	except IndexError:
+		# Index out of bounds, we don't have this text
+		return ""
+	except TypeError:
 		return ""
 
 	return text
 
-
-def union(a, b):
-    """ return the union of two lists """
-    return list(set(a) | set(b))
