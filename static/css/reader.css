@@ -1148,6 +1148,10 @@ body.noCommentary .aboutBarBox {
 	overflow: hidden;
 }
 
+body.english .commentaryBox .heOnly {
+	display: none;
+}
+
 body.hebrew .commentaryBox .commentary{
 	direction: rtl;
 	text-align: right;
