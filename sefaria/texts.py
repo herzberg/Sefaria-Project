@@ -34,6 +34,17 @@ logger = logging.getLogger("texts")
 #logger.setLevel(logging.DEBUG)
 logger.setLevel(logging.ERROR)
 
+debug_logger = logging.getLogger("parse_bible")
+debug_logger.setLevel(logging.DEBUG)
+
+def logdecorator(func):
+	def wrapper(*args, **kwargs):
+		debug_logger.debug("Calling {} with args {} and kwargs {}".format(func.__name__, args, kwargs))
+		result = func(*args, **kwargs)
+		debug_logger.debug("Returning {}".format(result))
+		return result
+	return wrapper
+
 # HTML Tag whitelist for sanitizing user submitted text
 ALLOWED_TAGS = ("i", "b", "br", "u", "strong", "em", "big", "small")
 
@@ -1348,7 +1359,7 @@ def section_level_ref(ref):
 
 	return make_ref(pRef)
 
-
+@logdecorator
 def save_text(ref, text, user, **kwargs):
 	"""
 	Save a version of a text named by ref.

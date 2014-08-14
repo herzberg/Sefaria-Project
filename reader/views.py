@@ -19,7 +19,7 @@ from django.contrib.auth.models import User
 # noinspection PyUnresolvedReferences
 from sefaria.model.user_profile import UserProfile
 # noinspection PyUnresolvedReferences
-from sefaria.texts import parse_ref, get_index, get_text, get_text_titles, make_ref_re
+from sefaria.texts import parse_ref, get_index, get_text, get_text_titles, make_ref_re, logdecorator
 # noinspection PyUnresolvedReferences
 from sefaria.history import text_history, get_maximal_collapsed_activity, top_contributors
 # noinspection PyUnresolvedReferences
@@ -35,6 +35,13 @@ from sefaria.utils.users import user_link
 from sefaria.sheets import LISTED_SHEETS
 import sefaria.system.locks as locks
 import sefaria.utils.calendars
+
+
+import logging
+logging.basicConfig()
+
+debug_logger = logging.getLogger("parse_bible")
+debug_logger.setLevel(logging.DEBUG)
 
 
 @ensure_csrf_cookie
@@ -143,7 +150,7 @@ def search(request):
 							 {}, 
 							 RequestContext(request))
 
-
+@logdecorator
 @csrf_exempt
 def texts_api(request, ref, lang=None, version=None):
 	if request.method == "GET":
