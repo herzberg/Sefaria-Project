@@ -37,12 +37,6 @@ import sefaria.system.locks as locks
 import sefaria.utils.calendars
 
 
-import logging
-logging.basicConfig()
-
-debug_logger = logging.getLogger("parse_bible")
-debug_logger.setLevel(logging.DEBUG)
-
 
 @ensure_csrf_cookie
 def reader(request, ref, lang=None, version=None):
@@ -149,9 +143,8 @@ def search(request):
 	return render_to_response('search.html',
 							 {}, 
 							 RequestContext(request))
-
-@logdecorator
 @csrf_exempt
+@logdecorator
 def texts_api(request, ref, lang=None, version=None):
 	if request.method == "GET":
 		cb = request.GET.get("callback", None)

@@ -34,14 +34,19 @@ logger = logging.getLogger("texts")
 #logger.setLevel(logging.DEBUG)
 logger.setLevel(logging.ERROR)
 
-debug_logger = logging.getLogger("parse_bible")
-debug_logger.setLevel(logging.DEBUG)
-
 def logdecorator(func):
+	dlogger = logging.getLogger(__name__)
+	dlogger.setLevel(logging.DEBUG)
+	formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+	fh = logging.FileHandler('debug.log')
+	fh.setLevel(logging.DEBUG)
+	fh.setFormatter(formatter)
+	if not dlogger.handlers:
+		dlogger.addHandler(fh)
 	def wrapper(*args, **kwargs):
-		debug_logger.debug("Calling {} with args {} and kwargs {}".format(func.__name__, args, kwargs))
+		dlogger.debug("Calling {}".format(func.__name__))
 		result = func(*args, **kwargs)
-		debug_logger.debug("Returning {}".format(result))
+		dlogger.debug("Returning from {}".format(func))
 		return result
 	return wrapper
 
