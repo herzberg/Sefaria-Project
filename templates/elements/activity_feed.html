@@ -109,11 +109,12 @@
         {% endif %}
     </li>
 {% empty %}
-	<br><br>
-    {% if profile %}
-        <h3>No {% if filter_type %}matching{% endif %} public activity yet.</h3>
+    {% if empty_message %}
+        <i>{{ empty_message }}</i>
+    {% elif profile %}
+        <i>No {% if filter_type %}matching{% endif %} public activity yet.</i>
     {% else %}
-	   <h3>No {% if filter_type %}matching{% endif %} public history items.</h3>
+	   <i>No {% if filter_type %}matching{% endif %} public history items.</i>
     {% endif %}
 {% endfor %}
 </ul>

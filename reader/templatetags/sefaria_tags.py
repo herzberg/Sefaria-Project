@@ -2,32 +2,28 @@
 """
 Custom Sefaria Tags for Django Templates
 """
-import re
 import dateutil.parser
-
 from django import template
 from django.template.defaultfilters import stringfilter
 from django.utils.safestring import mark_safe
-from django.utils.encoding import force_unicode
 from django.core.serializers import serialize
 from django.db.models.query import QuerySet
 from django.utils import simplejson
-from django.template import Library
-from django.contrib.auth.models import User
 from django.contrib.sites.models import Site
 
-
-from sefaria.texts import url_ref
-from sefaria.texts import parse_ref
+from sefaria.texts import url_ref, parse_ref, get_index
 from sefaria.sheets import get_sheet
-from sefaria.util import user_link as ulink, strip_tags as strip_tags_func
+from sefaria.utils.users import user_link as ulink
+from sefaria.utils.util import strip_tags as strip_tags_func
+
 
 register = template.Library()
 
 current_site = Site.objects.get_current()
 domain       = current_site.domain
 
-ref_link_cache = {} # simple cache for ur
+
+ref_link_cache = {} # simple cache for ref links
 @register.filter(is_safe=True)
 @stringfilter
 def ref_link(value, absolute=False):
@@ -58,6 +54,7 @@ def url_safe(value):
 def user_link(uid):
 	return mark_safe(ulink(uid))
 
+
 @register.filter(is_safe=True)
 def lang_code(code):
 	codes = {
@@ -66,6 +63,13 @@ def lang_code(code):
 		"bi": "Bilingual",
 	}
 	return codes.get(code, "Unknown Language")
+
+
+@register.filter(is_safe=True)
+def text_category(text):
+	"""Returns the top level category for text"""
+	i = get_index(text)
+	return mark_safe(i.get("categories", ["[no cats]"])[0])
 
 
 @register.filter(is_safe=True)
@@ -96,8 +100,9 @@ def sheet_link(value):
 	if "error" in sheet:
 		safe = "<a href='#'>[sheet not found]</a>"
 	else:
-		safe = "<a href='/sheets/%d'>%s</a>" % (value, strip_tags_func(sheet["title"]))
+		safe = "<a href='/sheets/%d' data-id='%d'>%s</a>" % (value, value, strip_tags_func(sheet["title"]))
 	return mark_safe(safe)
+
 
 @register.filter(is_safe=True)
 def absolute_link(value):
@@ -122,6 +127,37 @@ def trim_title(value):
 	safe = safe.replace(u"משנה תורה, ", "")
 
 	return mark_safe(safe)
+
+
+
+@register.filter(is_safe=True)
+@stringfilter
+def abbreviate_number(value):
+	"""
+	13,324,4234 -> 13M
+	35,234 -> 35k
+	231,421,412,432 - 231B
+	"""
+	try:
+		n = int(value)
+	except:
+		return mark_safe(value)
+
+	if n > 1000000000:
+		abbr = "%dB" % ( n / 1000000000 )
+	
+	elif n > 1000000:
+		abbr = "%dM" % ( n / 1000000 )
+	
+	elif n > 1000:
+		abbr = "%dk" % ( n / 1000 )
+
+	else:
+		abbr = str(n)
+
+
+
+	return mark_safe(abbr)
 
 
 @register.filter(is_safe=True)

@@ -3,20 +3,18 @@ sheets.py - backend core for Sefaria Source sheets
 
 Writes to MongoDB Collection: sheets
 """
-import sys
-import pymongo
-import cgi
-import simplejson as json
-import dateutil.parser
 from datetime import datetime
-from pprint import pprint
 
-from database import db
-from util import strip_tags, annotate_user_list
-from notifications import Notification
+import dateutil.parser
+
+from sefaria.system.database import db
+from sefaria.model.user_profile import annotate_user_list
+from sefaria.utils.util import strip_tags
+from sefaria.model.notifications import Notification
 from history import record_sheet_publication, delete_sheet_publication
 from settings import SEARCH_INDEX_ON_SAVE
 import search
+
 
 PRIVATE_SHEET      = 0 # Only the owner can view or edit (NOTE currently 0 is treated as 1)
 LINK_SHEET_VIEW    = 1 # Anyone with the link can view
@@ -69,19 +67,21 @@ def sheet_list(user_id=None):
 		sheet_list = db.sheets.find({"status": {"$in": LISTED_SHEETS }}).sort([["dateModified", -1]])
 	elif user_id:
 		sheet_list = db.sheets.find({"owner": int(user_id), "status": {"$ne": 5}}).sort([["dateModified", -1]])
-	response = {}
-	response["sheets"] = []
-	if sheet_list.count() == 0:
-		return response
-	while sheet_list.alive:
-	 	n = sheet_list.next()
+	
+	response = {
+		"sheets": [],
+	}
+
+	for sheet in sheet_list:
 		s = {}
-		s["id"] = n["id"]
-		s["title"] = n["title"] if "title" in n else "Untitled Sheet"
-		s["author"] = n["owner"]
-		s["size"] = len(n["sources"])
-		s["modified"] = dateutil.parser.parse(n["dateModified"]).strftime("%m/%d/%Y")
+		s["id"]       = sheet["id"]
+		s["title"]    = sheet["title"] if "title" in sheet else "Untitled Sheet"
+		s["author"]   = sheet["owner"]
+		s["size"]     = len(sheet["sources"])
+		s["modified"] = dateutil.parser.parse(sheet["dateModified"]).strftime("%m/%d/%Y")
+ 		
  		response["sheets"].append(s)
+ 
  	return response
 
 

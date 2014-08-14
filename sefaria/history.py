@@ -3,20 +3,20 @@ history.py - managing the revision/activity history.
 
 Write to MongoDB collection: history
 """
+
+# noinspection PyUnresolvedReferences
 import os
-import copy
-from pprint import pprint
-from datetime import datetime, date, timedelta
+from datetime import datetime
 from diff_match_patch import diff_match_patch
 from bson.code import Code
+from pprint import pprint
 
 # To allow these files to be run from command line
 os.environ['DJANGO_SETTINGS_MODULE'] = "settings"
 
-from util import *
-from database import db
+from sefaria.utils.util import *
+from sefaria.system.database import db
 import texts
-
 
 dmp = diff_match_patch()
 
@@ -368,35 +368,44 @@ def make_leaderboard(condition):
 	reducer = Code("""
 					function(obj, prev) {
 
+						// Total Points
 						switch(obj.rev_type) {
 							case "add text":
 								if (obj.language !== 'he' && obj.version === "Sefaria Community Translation") {
 									prev.count += Math.max(obj.revert_patch.length / 10, 10);
+									prev.translateCount += 1
 								} else if(obj.language !== 'he') {
 									prev.count += Math.max(obj.revert_patch.length / 400, 2);
+									prev.addCount += 1
 								} else {
 									prev.count += Math.max(obj.revert_patch.length / 800, 1);
+									prev.addCount += 1
 								}
 								break;
 							case "edit text":
 								prev.count += Math.max(obj.revert_patch.length / 1200, 1);
+								prev.editCount += 1
 								break;
 							case "revert text":
 								prev.count += 1;
 								break;
 							case "review":
 								prev.count += 15;
+								prev.reviewCount += 1;
 								break;
 							case "add index":
 								prev.count += 5;
 								break;
 							case "edit index":
 								prev.count += 1;
+								prev.editCount += 1
 								break;
 							case "add link":
 								prev.count += 2;
+								prev.linkCount += 1;
 								break;
 							case "edit link":
+								prev.editCount += 1
 								prev.count += 1;
 								break;
 							case "delete link":
@@ -404,23 +413,51 @@ def make_leaderboard(condition):
 								break;
 							case "add note":
 								prev.count += 1;
+								prev.noteCount += 1;
 								break;
 							case "edit note":
 								prev.count += 1;
 								break;
 							case "delete note":
 								prev.count += 1;
-								break;
-							case "review":
-								prev.count += 4
-								break;		
+								break;	
 						}
+
+						// Texts worked on
+						var refs = []
+						if ("ref" in obj && obj.ref) {
+							refs.push(obj.ref);
+						} else if ("refs" in obj && obj.refs[0] && obj.refs[1]) {
+							refs.push(obj.refs[0]);
+							refs.push(obj.refs[1]);
+						} 
+						refs.forEach(function(ref) {
+							var text = ref;
+							var i = text.search(/\d/);
+							var text = text.slice(0,i).trim()
+
+							if (prev.texts[text]) {
+								prev.texts[text] += 1;
+							} else {
+								prev.texts[text] = 1;
+							}
+						});
 					}
 				""")
 
 	leaders = db.history.group(['user'], 
 						condition, 
-						{'count': 0},
+						{
+							'count': 0,
+							'translateCount': 0,
+							'addCount': 0,
+							'editCount': 0,
+							'linkCount': 0,
+							'noteCount': 0,
+							'reviewCount': 0,
+
+							'texts': {}
+						},
 						reducer)
 
 	return sorted(leaders, key=lambda x: -x["count"])

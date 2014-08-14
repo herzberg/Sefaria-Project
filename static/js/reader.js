@@ -19,7 +19,6 @@ $.extend(sjs,  {
 		loading: false,        // are we currently loading a view? 
 		verseSelecting: false, // are we currently selecting a verse?
 		saving: false,         // are we currently saving text?
-		evenHaEzerPrompt: 3    // how many pages have been viewed since load
 	},
 	add: {
 		source: null
@@ -621,10 +620,7 @@ $(function() {
 
 	// ---------------- Edit Text Info ----------------------------
 
-	$("#editTextInfo").click(function() {
-		sjs.editing.title = sjs.current.book;
-		sjs.editTextInfo();
-	});
+	$("#editTextInfo").click(sjs.editTextInfo);
 
 
 // ------------- New Text --------------------------
@@ -1494,13 +1490,6 @@ function buildView(data) {
 	$("#aboutVersions").html(aboutHtml());	
 
 
-	// TODO - Can't properly handle editing text info for "Commentator on Book", disallow for now 
-	if (data.type == "Commentary") {
-		$("#editTextInfo").hide(); 
-	} else {
-		$("#editTextInfo").show();
-	}
-
 	// Don't allow editing a merged text
 	if ("sources" in data) {
 		$("#about").addClass("enMerged");
@@ -1607,6 +1596,7 @@ function buildView(data) {
 				$("html, body").animate({scrollTop: top}, scrollYDur)
 		 	}
 		 	
+		 	/*
 		 	// Show a contribute prompt on third page
 			sjs.flags.evenHaEzerPrompt -= 1;
 			if (sjs.flags.evenHaEzerPrompt === 0 && !$.cookie("hide_even_haezer_prompt")) {
@@ -1621,6 +1611,7 @@ function buildView(data) {
 				});
 
 			}
+			*/
 		}
 	});
 	// clear loading message
@@ -3157,6 +3148,8 @@ sjs.showNewIndex = function() {
 	sjs._$commentaryBox.hide();
 	sjs._$basetext.hide();
 	$(window).scrollLeft(0);
+
+	$("#newIndexMsg").hide();
 			
 	$("#textCategory").unbind().change(function() {
 		if ($(this).val() === "Other") $("#otherCategory").show();
@@ -3185,22 +3178,42 @@ sjs.showNewIndex = function() {
 };
 	
 
-sjs.editTextInfo = function(){
+sjs.editTextInfo = function() {
 	if (!sjs._uid) {
 		return sjs.loginPrompt();
 	}
-	$("#newIndexMsg").hide();
-	$("#textTitle").val(sjs.current.book);
-	sjs.current.titleVariants.forEach(function(variant) {
-		$("#textTitleVariants").tagit("createTag", variant);
-	});
-
+    sjs.clearNewIndex();
 	sjs.showNewIndex();
 
-	if (sjs.current.heBook) { 
-		$("#heTitle").val(sjs.current.heBook );
-	} else if (sjs.current.heTitle) {
-		$("#heTitle").val(sjs.current.heTitle );
+	var title    = sjs.current.commentator || sjs.current.book;
+	var variants = sjs.current.commentator ? [] : sjs.current.titleVariants;
+	var heTitle  = sjs.current.heBook || sjs.current.heTitle || null;
+
+	sjs.editing.title = title; 
+
+	// If this is a commentary, get commentator title variants from server
+	if (sjs.current.commentator) {
+		$.getJSON("/api/index/" + sjs.current.commentator, function(data){
+			$("#textTitle").val(data.title);
+			$("#heTitle").val(data.heTitle);
+			data.titleVariants.forEach(function(variant) {
+				$("#textTitleVariants").tagit("createTag", variant);
+			});
+		})
+	} else {
+		// Set Title
+		$("#textTitle").val(title);
+		// Set Title Variants
+		variants.forEach(function(variant) {
+			$("#textTitleVariants").tagit("createTag", variant);
+		});		
+	}
+
+
+
+	// set Hebrew Titles
+	if (heTitle) { 
+		$("#heTitle").val( heTitle );
 	}
 
 	// Make list of categories currently in the select
@@ -3208,15 +3221,18 @@ sjs.editTextInfo = function(){
 	$("#textCategory option").each(function() {
     	cats[$(this).attr("value")] = 1;
 	});
-	// Set the category if it's in the list, otherwise set it as "Other"
+
+	// Set the Category if it's in the list, otherwise set it as "Other"
 	if (sjs.current.type in cats) {
 		$("#textCategory").val(sjs.current.type);
 	} else {
 		$("#textCategory").val("Other");
 		$("#otherCategory").val(sjs.current.type).show();
 	}
-	
-	// Remove section name box if text depth is 1
+	// 
+	$("#textCategory").trigger("change");
+
+	// Remove a section name box if text depth is 1
 	if (sjs.current.sectionNames.length == 1) {
 		$(".sectionType:gt(0)").remove();
 	}
@@ -3242,6 +3258,7 @@ sjs.editTextInfo = function(){
 		$(this).find(".shorthandTo").val(sjs.current.maps[$(this).index()].to);
 
 	});
+
 	
 	// Check if texts are already saved with this schema,
 	// If so, disallow schema changes
@@ -3286,7 +3303,7 @@ sjs.readNewIndex = function() {
 	index.title = $("#textTitle").val();
 	if (sjs.editing.title && index.title !== sjs.editing.title) {
 		// Primary title change
-		index.oldTitle = sjs.current.book;
+		index.oldTitle = sjs.editing.title;
 		sjs.cache.killAll()
 	}
 
@@ -3297,7 +3314,7 @@ sjs.readNewIndex = function() {
 	var cat = $("#textCategory").val();
 	// Don't allow category updates to Tanach, Mishnah or Talmud
 	// HACK to deal with incomplete handling on subcategories 
-	if (cat in {"Tanach": 1, "Mishnah": 1, "Talmud": 1}) {
+	if (cat in {"Tanach": 1, "Mishnah": 1, "Talmud": 1, "Tosefta": 1}) {
 		index.categories = sjs.current.categories || "locked";
 	} else {
 		index.categories = (cat == "Other" ? [$("#otherCategory").val()] : [cat]);
@@ -3403,7 +3420,10 @@ sjs.saveNewIndex = function(index) {
 			$("#newIndex").hide();
 			sjs.clearNewIndex();
 			sjs.alert.message("Text information saved.");
-			get(parseRef(data.title + " " + sjs.current.sections.join(" ")));
+			var ref = data.title + " " +
+				(data.categories[0] == "Commentary" ? "on " + sjs.current.commentaryBook + " " : "") +
+				sjs.current.sections.join(" ");
+			get(parseRef(ref));
 		} else {
 			$("#newIndex").hide();
 			sjs.books.push.apply(sjs.books, data.titleVariants);

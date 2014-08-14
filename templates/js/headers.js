@@ -1,12 +1,15 @@
 {% load sefaria_tags %}
 
+<script src="/static/js/keyboard.js"></script>
 <script type="text/javascript">
 {% autoescape off %}
 	var sjs = sjs || {};
-	
+
 	$.extend(sjs, {
 		books: {{ titlesJSON|default:"[]" }},
 		searchBaseUrl: '{{ SEARCH_URL|default:"http://localhost:9200" }}',
+		searchIndex: '{{ SEARCH_INDEX_NAME }}',
+		is_moderator: {% if user.is_staff %}true{% else %}false{% endif %},
 		help: {
 			videos: {
 				intro:       "TaUB0jd0dzI",
@@ -25,28 +28,14 @@
 	});
 
 	$(function() {
-		// Open a text Box
-		$("#goto").autocomplete({ source: function( request, response ) {
-				var matches = $.map( sjs.books, function(tag) {
-						if ( tag.toUpperCase().indexOf(request.term.toUpperCase()) === 0 ) {
-							return tag;
-						}
-					});
-				response(matches);
-			}
-		}).keypress(function(e) {
-			if (e.keyCode == 13) {
-				handleSearch();
-			}
-		});
-		$("#openText").mousedown(handleSearch);
 
-		var handleSearch = function() {
+		// Search 
+		sjs.handleSearch = function() {
 			$("#goto").focus();
 			var query = $("#goto").val();
 			if (query) {
 				$("#goto").autocomplete("close");
-				
+
 				if (isRef(query)) {
 					sjs.navQuery(query);
 					sjs.track.ui("Nav Query");
@@ -59,6 +48,28 @@
 				}
 			}
 		};
+
+		// Open a text Box
+		$("#goto").autocomplete({ source: function( request, response ) {
+				var matches = $.map( sjs.books, function(tag) {
+						if ( tag.toUpperCase().indexOf(request.term.toUpperCase()) === 0 ) {
+							return tag;
+						}
+					});
+				response(matches);
+			}
+		}).keypress(function(e) {
+			if (e.keyCode == 13) {
+				sjs.handleSearch();
+			}
+		}).focus(function() {
+			$(this).css({"width": "300px"});
+			$(".keyboardInputInitiator").css({"opacity": 1});
+		}).blur(function() {
+			$(".keyboardInputInitiator").css({"opacity": 0});
+		});
+	
+		$("#openText").mousedown(sjs.handleSearch);
 
 
 		// Top Menus showing / hiding
@@ -111,7 +122,7 @@
 
 
 	    // Notifications - Mark as read
-	    $("#accountBox").mouseenter(function() {
+	    $("#notificationsButton").mouseenter(function() {
 	    	if ($("#newNotificationsCount").length) {
 				sjs.markNotificationsAsRead();
 	    	}
@@ -127,11 +138,11 @@
 				});			
 			}
 			var unread = parseInt($("#newNotificationsCount").text()) - ids.length;
-			if (unread < 1) { 
-				$("#newNotificationsCount").replaceWith('<span class="ui-icon ui-icon-triangle-1-s"></span>');
- 			} else {
- 				$("#newNotificationsCount").text(unread);
- 			}
+			if (unread == 0 ) {
+				$("#newNotificationsCount").hide();
+			}
+			$("#newNotificationsCount").text(unread);
+ 			
 	    };
 
 	    // Notifications - Load more through scrolling

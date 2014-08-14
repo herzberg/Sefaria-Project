@@ -1,12 +1,9 @@
-import sys
-import os
-from pprint import pprint
-from datetime import datetime, date, timedelta
+from datetime import datetime
 
 from bson.objectid import ObjectId
 
-from settings import *
-from util import *
+from sefaria.utils.users import user_link
+from sefaria.utils.util import *
 import texts
 
 # To allow these files to be run from command line

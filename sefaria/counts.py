@@ -12,8 +12,8 @@ from pprint import pprint
 
 import texts
 import summaries
-from util import *
-from database import db
+from sefaria.utils.util import *
+from sefaria.system.database import db
 
 
 def count_texts(ref, lang=None):
@@ -61,10 +61,10 @@ def update_counts(ref=None):
 	for index in indices:
 		if index["categories"][0] == "Commentary":
 			cRef = "^" + index["title"] + " on "
-			texts = db.texts.find({"title": {"$regex": cRef}})
+			texts = db.texts.find({"title": {"$regex": cRef}}).distinct("title")
 			for text in texts:
-				update_text_count(text["title"], index)
-		else:	
+				update_text_count(text, index)
+		else:
 			update_text_count(index["title"])
 
 	summaries.update_summaries()
@@ -74,13 +74,15 @@ def update_text_count(ref, index=None):
 	"""
 	Update the count records of the text specfied 
 	by ref (currently at book level only) by peforming a count
-	"""	
+	"""
 	index = texts.get_index(ref)
 	if "error" in index:
 		return index
 
 	c = { "title": ref }
-	db.counts.remove(c)
+	existing = db.counts.find_one(c)
+	if existing:
+		c = existing
 
 	if index["categories"][0] in ("Tanach", "Mishnah", "Talmud"):
 		# For these texts, consider what is present in the db across 
@@ -103,7 +105,7 @@ def update_text_count(ref, index=None):
 		totals = zero_jagged_array(sum_count_arrays(en["counts"], he["counts"]))
 
 	enCount = sum_count_arrays(en["counts"], totals)
-	heCount = sum_count_arrays(he["counts"], totals) 
+	heCount = sum_count_arrays(he["counts"], totals)
 
 	c["availableTexts"] = {
 		"en": enCount,
@@ -127,8 +129,19 @@ def update_text_count(ref, index=None):
 		else:
 			hp = heTotal / float(total) * 100
 			ep = enTotal / float(total) * 100
+
+			#temp check to see if text has wrong metadata leading to incorrect (to high) percentage
+			"""if hp > 100:
+				print index["title"], " in hebrew has stats out of order: ", heTotal, "/", total, "=", hp
+			if ep > 100:
+				print index["title"], " in english has stats out of order: ", enTotal, "/", total, "=", ep"""
+
+	elif "length" in index:
+		hp = c["availableCounts"]["he"][0] / float(index["length"]) * 100
+		ep = c["availableCounts"]["en"][0] / float(index["length"]) * 100
 	else: 
 		hp = ep = 0
+
 
 	c["percentAvailable"] = {
 		"he": hp,
@@ -139,8 +152,99 @@ def update_text_count(ref, index=None):
 		"en": ep > 99.9,
 	}
 
+	#function to estimate how much of a text we have
+	c['estimatedCompleteness'] = {
+		"he" : estimate_completeness('he', index, c),
+		"en" : estimate_completeness('en', index, c)
+	}
+
 	db.counts.save(c)
 	return c
+
+
+def estimate_completeness(lang, index, count):
+	"""
+	Calculates an estimate of complete the text is, given whatever information exists.
+	TODO: this function is still a work in progress.
+	:param lang: language to compute
+	:param index: the text index object
+	:param count: the text counts oject
+	:return: a struct with various variables estimating the completness of the text
+	"""
+	result = {}
+	#TODO: it's problematic to calculate the commentaries this way,
+	#as they might by default have many empty elements.
+	result['estimatedPercent']        = calc_text_structure_completeness(index['textDepth'],count['availableTexts'][lang])
+	result['availableSegmentCount']   = count["availableCounts"][lang][-1]
+	result['percentAvailableInvalid'] = count['percentAvailable'][lang] > 100 or not ("length" in index and "lengths" in index)
+	result['percentAvailable']        = count['percentAvailable'][lang]
+
+	result['isSparse'] = text_sparseness_level(result, index, count, lang)
+	return result
+
+
+def text_sparseness_level(stat_obj, index, count, lang):
+	"""
+	Returns a rating integer (from 1-4) of how sparse the text is. 1 being most sparse and 4 considered basically ok.
+	:param stat_obj: completeness estimate object
+	:param index: the text index object
+	:param count: the text counts oject
+	:param lang: language to compute
+
+	:return: how sparse the text is, from 1 (vry) to 4 (almost complete or complete)
+	"""
+	#if we have an absolute percentage from metadata info on the text, use that.
+	if stat_obj['percentAvailableInvalid']:
+		percentCalc = stat_obj['estimatedPercent']
+	else:
+		percentCalc = stat_obj['percentAvailable']
+
+	lang_flag = "%sComplete" % lang
+	if "flags" in count and count["flags"].get(lang_flag, False): # if manually marked as complete, consider it complete
+		is_sparse = 4
+	#if it's a commentary, it might have many empty places, so just consider bulk amount of text
+	elif index["categories"][0] == "Commentary" and  stat_obj["availableSegmentCount"] >= 300:
+		is_sparse = 2
+	#if it's basic count is under a given constant (e.g. 25) consider sparse. This will casue issues with some small texts
+	#that the manual flags will fix
+	elif stat_obj["availableSegmentCount"] <= 25:
+		is_sparse = 1
+
+	elif percentCalc <= 15:
+		is_sparse = 1
+	elif 15 < percentCalc <= 50:
+		is_sparse = 2
+	elif 50 < percentCalc <= 90:
+		is_sparse = 3
+	else:
+		is_sparse = 4
+
+	return is_sparse
+
+
+def update_links_count(text=None):
+	"""
+	Counts the links that point to a particular text, or all of them
+
+	Results are stored them on the 'linksCount' field of the counts document
+	"""
+	if not text:
+		counts = db.counts.find({"title": {"$exists": 1}})
+		for c in counts:
+			if c["title"]:
+				update_links_count(text=c["title"])
+
+	print "%s" % text
+	index = texts.get_index(text)
+	if "error" in index:
+		return index
+
+	c = { "title": text }
+	c = db.counts.find_one(c)
+
+	c["linksCount"] = db.links.find({"refs": {"$regex": texts.make_ref_re(text)}}).count()
+
+	db.counts.save(c)
 
 
 def count_category(cat, lang=None):
@@ -155,8 +259,8 @@ def count_category(cat, lang=None):
 		en = count_category(cat, "en")
 		he = count_category(cat, "he")
 		counts = {
-					"percentAvailable": { 
-						"he": he["percentAvailable"], 
+					"percentAvailable": {
+						"he": he["percentAvailable"],
 						"en": en["percentAvailable"]
 						},
 					"availableCounts": {
@@ -168,7 +272,7 @@ def count_category(cat, lang=None):
 			"he": he["percentAvailable"] > 99.5,
 			"en": en["percentAvailable"] > 99.5,
 		}
-		
+
 		# Save to the DB
 		remove_doc = {"$and": [{'categories.0': cat[0]}, {"categories": {"$all": cat}}, {"categories": {"$size": len(cat)}} ]}
 		db.counts.remove(remove_doc)
@@ -190,12 +294,12 @@ def count_category(cat, lang=None):
 		text_count = db.counts.find_one({ "title": text["title"] })
 		if not text_count or "availableCounts" not in text_count or "sectionNames" not in text:
 			continue
-	
+
 		c = text_count["availableCounts"][lang]
 		for i in range(len(text["sectionNames"])):
 			if len(c) > i:
 				counts[text["sectionNames"][i]] += c[i]
-	
+
 		if "percentAvailable" in text_count and isinstance(percent, float):
 			percentCount += 1
 			percent += text_count["percentAvailable"][lang] if isinstance(text_count["percentAvailable"][lang], float) else 0.0
@@ -254,6 +358,42 @@ def count_array(text):
 		return 0 if not text else 1
 
 
+def calc_text_structure_completeness(text_depth, structure):
+	"""
+	This function calculates the percentage of how full an array is compared to it's structre
+	i.e how many elements are not null or zero
+	:param text_depth: the depth of the array
+	:param structure: a counts structure from count_texts()
+	:return: a precentage of the array fullness
+	"""
+	result = {'full': 0, 'total':0}
+	rec_calc_text_structure_completeness(text_depth,structure, result)
+	return float(result['full']) / result['total'] * 100
+
+
+def rec_calc_text_structure_completeness(depth, text, result):
+	"""
+	Recursive sub-utility function of the above function. Carries out the actual calculation recursively.
+	:param depth: the depth of the current structure
+	:param text: the structure to count
+	:param result: the result obj to update
+	:return: the result obj
+	"""
+	if isinstance(text, list):
+		#empty array
+		if not text:
+			#an empty array element may represent a lot of missing text
+			#TODO: maybe find a better estimate (average of text lengths at a certain depth?)
+			result['total'] += 3**depth
+		else:
+			for t in text:
+				rec_calc_text_structure_completeness(depth-1, t, result)
+	else:
+		result['total'] += 1
+		if text is not None and text != "" and text > 0:
+			result['full'] += 1
+
+
 def sum_count_arrays(a, b):
 	"""
 	Returns a multi-dimensional array which sums each position of
@@ -262,9 +402,9 @@ def sum_count_arrays(a, b):
 	"""
 	# Treat None as 0 
 	if a is None:
-		return sum_count_arrays(0, b) 
+		return sum_count_arrays(0, b)
 	if b is None:
-		return sum_count_arrays(a, 0) 
+		return sum_count_arrays(a, 0)
 
 	# If one value is an int while the other is a list, 
 	# Treat the int as an empty list. 
@@ -280,7 +420,7 @@ def sum_count_arrays(a, b):
 	# If both are lists, recur on each pair of values
 	# map results in None value when element not present
 	if isinstance(a, list) and isinstance(b, list):
-		return [sum_count_arrays(a2, b2) for a2, b2 in map(None, a, b)]	
+		return [sum_count_arrays(a2, b2) for a2, b2 in map(None, a, b)]
 
 	return "sum_count_arrays reached a condition it shouldn't have reached"
 
@@ -397,11 +537,11 @@ def get_counts_doc(text):
 	"""
 	Returns the stored count doc for 'text',
 	where text is a text title, text category or list of categories. 
-	"""	
+	"""
 	if isinstance(text, list):
 		# text is a list of categories
 		return get_category_count(text)
-	
+
 	categories = texts.get_text_categories()
 	if text in categories:
 		# text is a single category name
@@ -411,6 +551,15 @@ def get_counts_doc(text):
 	query = {"title": text}
 	c = db.counts.find_one(query)
 	return c
+
+
+def set_counts_flag(title, flag, val):
+	"""
+	Set a flag on the counts doc for title. 
+	"""
+	flag = "flags.%s" % flag
+	db.counts.update({"title": title}, {"$set": {flag: val}})
+	delete_template_cache("texts_dashboard")
 
 
 def make_available_counts_dict(index, count):
@@ -430,7 +579,7 @@ def make_available_counts_dict(index, count):
 			else:
 				counts["he"][name] = count["availableCounts"]["he"][num]
 				counts["en"][name] = count["availableCounts"]["en"][num]
-	
+
 	return counts
 
 
@@ -497,7 +646,7 @@ def generate_refs_list(query={}):
 	counts = db.counts.find(query)
 	for c in counts:
 		if "title" not in c:
-			continue # this is a category count
+			continue  # this is a category count
 
 		i = texts.get_index(c["title"])
 		if ("error" in i):
@@ -508,7 +657,7 @@ def generate_refs_list(query={}):
 		title = c["title"]
 		he = list_from_counts(c["availableTexts"]["he"])
 		en = list_from_counts(c["availableTexts"]["en"])
-		sections = union(he, en)
+		sections = texts.union(he, en)
 		for n in sections:
 			if i["categories"][0] == "Talmud":
 				n = texts.section_to_daf(int(n))

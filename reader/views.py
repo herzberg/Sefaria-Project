@@ -1,35 +1,40 @@
-import dateutil.parser
-import dateutil.parser
+# noinspection PyUnresolvedReferences
 from datetime import datetime, timedelta
-from pprint import pprint
-from collections import defaultdict
-from numbers import Number
 from sets import Set
 from random import randint
-from bson.json_util import dumps
 
-from django.template import Context, loader, RequestContext
+from bson.json_util import dumps
+from django.template import RequestContext
 from django.shortcuts import render_to_response, get_object_or_404, redirect
-from django.http import HttpResponse, HttpResponseRedirect, Http404
+
+# noinspection PyUnresolvedReferences
+from django.http import HttpResponse, Http404
 from django.contrib.auth.decorators import login_required
 from django.views.decorators.csrf import ensure_csrf_cookie, csrf_exempt, csrf_protect
-from django.core.urlresolvers import reverse
+# noinspection PyUnresolvedReferences
 from django.utils import simplejson as json
+# noinspection PyUnresolvedReferences
 from django.contrib.auth.models import User
 
-from sefaria.texts import parse_ref, get_index, get_text, get_text_titles
-from sefaria.history import get_maximal_collapsed_activity
-from sefaria.util import *
-from sefaria.calendars import *
+# noinspection PyUnresolvedReferences
+from sefaria.model.user_profile import UserProfile
+# noinspection PyUnresolvedReferences
+from sefaria.texts import parse_ref, get_index, get_text, get_text_titles, make_ref_re
+# noinspection PyUnresolvedReferences
+from sefaria.history import text_history, get_maximal_collapsed_activity, top_contributors
+# noinspection PyUnresolvedReferences
+from sefaria.utils.util import *
 from sefaria.workflows import *
 from sefaria.reviews import *
-from sefaria.summaries import get_toc
-from sefaria.counts import get_percent_available, get_translated_count_by_unit, get_untranslated_count_by_unit
-from sefaria.notifications import Notification, NotificationSet
-from sefaria.users import UserProfile
+from sefaria.summaries import get_toc, flatten_toc
+from sefaria.counts import get_percent_available, get_translated_count_by_unit, get_untranslated_count_by_unit, set_counts_flag
+from sefaria.model.notifications import Notification, NotificationSet
+from sefaria.model.following import FollowRelationship, FollowersSet, FolloweesSet
+from sefaria.model.user_profile import annotate_user_list
+from sefaria.utils.users import user_link
 from sefaria.sheets import LISTED_SHEETS
-import sefaria.locks
-import sefaria.calendars
+import sefaria.system.locks as locks
+import sefaria.utils.calendars
 
 
 @ensure_csrf_cookie
@@ -190,7 +195,7 @@ def texts_api(request, ref, lang=None, version=None):
 
 def parashat_hashavua_api(request):
 	callback = request.GET.get("callback", None)
-	p = sefaria.calendars.this_weeks_parasha(datetime.now())
+	p = sefaria.utils.calendars.this_weeks_parasha(datetime.now())
 	p["date"] = p["date"].isoformat()
 	p.update(get_text(p["ref"]))
 	return jsonResponse(p, callback)
@@ -243,14 +248,30 @@ def counts_api(request, title):
 	"""
 	if request.method == "GET":
 		return jsonResponse(get_counts(title))
-	else:
-		return jsonResponse({"error": "Unsuported HTTP method."})
+
+	elif request.method == "POST":
+		if not request.user.is_staff:
+			return jsonResponse({"error": "Not permitted."})
+
+		if "update" in request.GET:
+			flag = request.GET.get("flag", None)
+			if not flag:
+				return jsonResponse({"error": "'flag' parameter missing."})
+			val  = request.GET.get("val", None)
+			val = True if val == "true" else False
+
+			set_counts_flag(title, flag, val)
+
+			return jsonResponse({"status": "ok"})
+
+		return jsonResponse({"error": "Not implemented."})
+
 
 
 @csrf_exempt
 def links_api(request, link_id_or_ref=None):
 	"""
-	API for manipulating textual links.
+	API for sting textual links.
 	Currently also handles post notes.
 	"""
 	#TODO: can we distinguish between a link_id (mongo id) for POSTs and a ref for GETs?
@@ -269,8 +290,11 @@ def links_api(request, link_id_or_ref=None):
 		if not j:
 			return jsonResponse({"error": "Missing 'json' parameter in post data."})
 		j = json.loads(j)
-		# use the correct function if params indicate this is a note save
-		func = save_note if "type" in j and j["type"] == "note" else save_link
+		if isinstance(j, list):
+			func = save_link_batch
+		else:
+			# use the correct function if params indicate this is a note save
+			func = save_note if "type" in j and j["type"] == "note" else save_link
 
 		if not request.user.is_authenticated():
 			key = request.POST.get("apikey")
@@ -286,7 +310,6 @@ def links_api(request, link_id_or_ref=None):
 				response = func(j, request.user.id)
 				return jsonResponse(response)
 			return protected_link_post(request)
-			# does this need @csrf_protect?
 	
 	if request.method == "DELETE":
 		if not link_id_or_ref:
@@ -334,7 +357,7 @@ def set_lock_api(request, ref, lang, version):
 	API to set an edit lock on a text segment.
 	"""
 	user = request.user.id if request.user.is_authenticated() else 0
-	sefaria.locks.set_lock(norm_ref(ref), lang, version.replace("_", " "), user)
+	locks.set_lock(norm_ref(ref), lang, version.replace("_", " "), user)
 	return jsonResponse({"status": "ok"})
 
 
@@ -342,7 +365,7 @@ def release_lock_api(request, ref, lang, version):
 	"""
 	API to release the edit lock on a text segment.
 	"""
-	sefaria.locks.release_lock(norm_ref(ref), lang, version.replace("_", " "))
+	locks.release_lock(norm_ref(ref), lang, version.replace("_", " "))
 	return jsonResponse({"status": "ok"})
 
 
@@ -350,7 +373,7 @@ def check_lock_api(request, ref, lang, version):
 	"""
 	API to check whether a text segment currently has an edit lock.
 	"""
-	locked = sefaria.locks.check_lock(norm_ref(ref), lang, version.replace("_", " "))
+	locked = locks.check_lock(norm_ref(ref), lang, version.replace("_", " "))
 	return jsonResponse({"locked": locked})
 
 
@@ -431,6 +454,37 @@ def messages_api(request):
 
 	elif request.method == "GET":
 		return jsonResponse({"error": "Unsupported HTTP method."})
+
+
+def follow_api(request, action, uid):
+	"""
+	API for following and unfollowing another user.
+	"""
+	if request.method != "POST":
+		return jsonResponse({"error": "Unsupported HTTP method."})
+
+	if not request.user.is_authenticated():
+		return jsonResponse({"error": "You must be logged in to follow."})
+
+	follow = FollowRelationship(follower=request.user.id, followee=int(uid))
+	if action == "follow":
+		follow.follow()
+	elif action == "unfollow":
+		follow.unfollow()
+
+	return jsonResponse({"status": "ok"}) 
+
+
+def follow_list_api(request, kind, uid):
+	"""
+	API for retrieving a list of followers/followees for a given user.
+	"""
+	if kind == "followers":
+		f = FollowersSet(int(uid))
+	elif kind == "followees":
+		f = FolloweesSet(int(uid))
+
+	return jsonResponse(annotate_user_list(f.uids))
 
 
 def texts_history_api(request, ref, lang=None, version=None):
@@ -633,31 +687,49 @@ def user_profile(request, username, page=1):
 	"""
 	User's profile page. 
 	"""
-	user           = get_object_or_404(User, username=username)	
-	profile        = UserProfile(user.id)
-	
-	page_size      = 50
+	try:
+		profile    = UserProfile(slug=username)
+		user       = get_object_or_404(User, id=profile.id)	
+	except:
+		# Couldn't find by slug, try looking up by username (old style urls)
+		# If found, redirect to new URL
+		# If we no longer want to support the old URLs, we can remove this
+		user       = get_object_or_404(User, username=username)	
+		profile    = UserProfile(id=user.id)
+
+		return redirect("/profile/%s" % profile.slug, permanent=True)
+
+
+	following      = profile.followed_by(request.user.id) if request.user.is_authenticated() else False
+
+	page_size      = 20
 	page           = int(page) if page else 1
-	query          = {"user": user.id}
+	query          = {"user": profile.id}
 	filter_type    = request.GET["type"] if "type" in request.GET else None
-	activity, page = get_maximal_collapsed_activity(query=query, page_size=page_size, page=page, filter_type=filter_type)
+	activity, apage= get_maximal_collapsed_activity(query=query, page_size=page_size, page=page, filter_type=filter_type)
+	notes, npage   = get_maximal_collapsed_activity(query=query, page_size=page_size, page=page, filter_type="add_note")
 
 	contributed    = activity[0]["date"] if activity else None 
-	scoreDoc       = db.leaders_alltime.find_one({"_id": user.id})
-	score          = int(scoreDoc["count"]) if scoreDoc else 0
-	sheets         =  db.sheets.find({"owner": user.id, "status": {"$in": LISTED_SHEETS }})
+	scores         = db.leaders_alltime.find_one({"_id": profile.id})
+	score          = int(scores["count"]) if scores else 0
+	user_texts     = scores.get("texts", None) if scores else None
+	sheets         = db.sheets.find({"owner": profile.id, "status": {"$in": LISTED_SHEETS }}, {"id": 1, "datePublished": 1}).sort([["datePublished", -1]])
 
-	next_page      = page + 1 if page else None
-	next_page      = "/contributors/%s/%d" % (username, next_page) if next_page else None
+	next_page      = apage + 1 if apage else None
+	next_page      = "/profile/%s/%d" % (username, next_page) if next_page else None
 
-	return render_to_response('profile.html', 
-							 {'profile': user,
-							 	'extended_profile': profile,
+	return render_to_response("profile.html", 
+							 {
+							 	'profile': profile,
+							 	'following': following,
 								'activity': activity,
 								'sheets': sheets,
+								'notes': notes,
 								'joined': user.date_joined,
 								'contributed': contributed,
 								'score': score,
+								'scores': scores,
+								'user_texts': user_texts,
 								'filter_type': filter_type,
 								'next_page': next_page,
 								"single": False,
@@ -667,7 +739,7 @@ def user_profile(request, username, page=1):
 
 def profile_api(request):
 	"""
-	API for editing user profile.
+	API for user profiles.
 	"""
 	if not request.user.is_authenticated():
 		return jsonResponse({"error": "You must be logged in to update your profile."})
@@ -679,12 +751,50 @@ def profile_api(request):
 			return jsonResponse({"error": "No post JSON."})
 		profileUpdate = json.loads(profileJSON)
 
-		profile = UserProfile(request.user.id)
-		profile.update(profileUpdate).save()
+		profile = UserProfile(id=request.user.id)
+		profile.update(profileUpdate)
 
-		return jsonResponse({"status": "ok"})
+		error = profile.errors()
+		if error:
+			return jsonResponse({"error": error})
+		else:
+			profile.save()
+			return jsonResponse(profile.to_DICT())
 
 	return jsonResponse({"error": "Unsupported HTTP method."})
+
+
+def profile_redirect(request, username, page=1):
+	"""
+	Redirect to a user profile
+	"""
+	return redirect("/profile/%s" % username, permanent=True)
+
+
+@login_required
+def my_profile(request):
+	""""
+	Redirect to the profile of the logged in user.
+	"""
+	return redirect("/profile/%s" % UserProfile(id=request.user.id).slug)
+
+
+@login_required
+@ensure_csrf_cookie
+def edit_profile(request):
+	"""
+	Page for managing a user's account settings.
+	"""
+	profile = UserProfile(id=request.user.id)
+	sheets  = db.sheets.find({"owner": profile.id, "status": {"$in": LISTED_SHEETS }}, {"id": 1, "datePublished": 1}).sort([["datePublished", -1]])
+
+	return render_to_response('edit_profile.html', 
+							 {
+							    'user': request.user,
+							 	'profile': profile,
+							 	'sheets': sheets,
+							  }, 
+							 RequestContext(request))
 
 
 @login_required
@@ -693,7 +803,7 @@ def account_settings(request):
 	"""
 	Page for managing a user's account settings.
 	"""
-	profile = UserProfile(request.user.id)
+	profile = UserProfile(id=request.user.id)
 	return render_to_response('account_settings.html', 
 							 {
 							    'user': request.user,
@@ -706,9 +816,9 @@ def splash(request):
 	"""
 	Homepage a.k.a. Splash page.
 	"""
-	daf_today          = daf_yomi(datetime.now())
-	daf_tomorrow       = daf_yomi(datetime.now() + timedelta(1))
-	parasha            = this_weeks_parasha(datetime.now())
+	daf_today          = sefaria.utils.calendars.daf_yomi(datetime.now())
+	daf_tomorrow       = sefaria.utils.calendars.daf_yomi(datetime.now() + timedelta(1))
+	parasha            = sefaria.utils.calendars.this_weeks_parasha(datetime.now())
 	metrics            = db.metrics.find().sort("timestamp", -1).limit(1)[0]
 	activity, page     = get_maximal_collapsed_activity(query={}, page_size=5, page=1)
 
@@ -729,6 +839,32 @@ def splash(request):
 
 
 @ensure_csrf_cookie
+def dashboard(request):
+	"""
+	Dashboard page -- table view of all content
+	"""
+	counts = db.counts.find({"title": {"$exists": 1}}, 
+		{"title": 1, "flags": 1, "linksCount": 1, "percentAvailable": 1})
+	
+	toc = get_toc()
+	flat_toc = flatten_toc(toc)
+
+	def toc_sort(a):
+		try:
+			return flat_toc.index(a["title"])
+		except:
+			return 9999
+
+	counts = sorted(counts, key=toc_sort)
+
+	return render_to_response('dashboard.html',
+								{
+									"counts": counts,
+								},
+								RequestContext(request))
+
+
+@ensure_csrf_cookie
 def translation_flow(request, ref):
 	"""
 	Assign a user a paritcular bit of text to translate within 'ref',
@@ -741,7 +877,7 @@ def translation_flow(request, ref):
 	next_section = None
 
 	# expire old locks before checking for a currently unlocked text
-	sefaria.locks.expire_locks()
+	locks.expire_locks()
 
 	pRef = parse_ref(ref, pad=False)
 	if "error" not in pRef and len(pRef["sections"]) == 0:
@@ -833,7 +969,7 @@ def translation_flow(request, ref):
 
 	# Put a lock on this assignment
 	user = request.user.id if request.user.is_authenticated() else 0
-	sefaria.locks.set_lock(assigned_ref, "en", "Sefaria Community Translation", user)
+	locks.set_lock(assigned_ref, "en", "Sefaria Community Translation", user)
 	
 	# if the assigned text is actually empty, run this request again
 	# but leave the new lock in place to skip over it

@@ -2,34 +2,48 @@
 """
 texts.py -- backend core for manipulating texts, refs (citations), links, notes and text index records.
 
-MongoDB collections handled in this file: index, texts, links, notes
+MongoDB collections handled in this file: index, texts, links, notes, history
 """
+# noinspection PyUnresolvedReferences
 import os
 import re
-import copy
-from pprint import pprint
 
 # To allow these files to be run directly from command line (w/o Django shell)
 os.environ['DJANGO_SETTINGS_MODULE'] = "settings"
 
-from bson.objectid import ObjectId
+# noinspection PyUnresolvedReferences
+import copy
+import regex
 import bleach
+from pprint import pprint
+from bson.objectid import ObjectId
+from django.utils import simplejson as json
 
-from util import *
-from history import *
-from database import db
-from hebrew import encode_hebrew_numeral, decode_hebrew_numeral
-from search import add_ref_to_index_queue
+# noinspection PyUnresolvedReferences
+from sefaria.utils.util import list_depth, delete_template_cache, union
+from sefaria.utils.users import user_link, is_user_staff
+from sefaria.system.database import db
+from sefaria.utils.hebrew import encode_hebrew_numeral, decode_hebrew_numeral, is_hebrew
+from history import * #record_text_change, record_obj_change
 import summaries
+import counts
+
+import logging
+logging.basicConfig()
+logger = logging.getLogger("texts")
+#logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.ERROR)
 
 # HTML Tag whitelist for sanitizing user submitted text
-ALLOWED_TAGS = ("i", "b", "u", "strong", "em", "big", "small")
+ALLOWED_TAGS = ("i", "b", "br", "u", "strong", "em", "big", "small")
 
 # Simple caches for indices, parsed refs, table of contents and texts list
 indices = {}
+he_indices = {}
 parsed = {}
 toc_cache = None
 texts_titles_cache = None
+he_texts_titles_cache = None
 texts_titles_json = None
 
 
@@ -41,6 +55,9 @@ def get_index(book):
 	res = indices.get(book)
 	if res:
 		return copy.deepcopy(res)
+
+	if not book:
+		return {"error": "No book provided."}
 
 	book = (book[0].upper() + book[1:]).replace("_", " ")
 	i = db.index.find_one({"titleVariants": book})
@@ -56,7 +73,7 @@ def get_index(book):
 
 	# Try matching "Commentator on Text" e.g. "Rashi on Genesis"
 	commentators = db.index.find({"categories.0": "Commentary"}).distinct("titleVariants")
-	books = db.index.find({"categories.0": {"$in": ["Tanach", "Mishnah", "Talmud"]}}).distinct("titleVariants")
+	books = db.index.find({"categories.0": {"$in": ["Tanach", "Mishnah", "Talmud", "Halakhah"]}}).distinct("titleVariants")
 
 	commentatorsRe = "^(" + "|".join(commentators) + ") on (" + "|".join(books) +")$"
 	match = re.match(commentatorsRe, book)
@@ -69,20 +86,38 @@ def get_index(book):
 		i["commentator"] = match.group(1)
 		if "heTitle" in i:
 			i["heCommentator"] = i["heTitle"]
-		i["title"] = match.group(1) + " on " + bookIndex["title"]
+		i["title"] = i["title"] + " on " + bookIndex["title"]
 		if "heTitle" in i and "heTitle" in bookIndex:
 			i["heBook"] = i["heTitle"]
 			i["heTitle"] = i["heTitle"] + u" \u05E2\u05DC " + bookIndex["heTitle"]
 		i["sectionNames"] = bookIndex["sectionNames"] + ["Comment"]
 		i["textDepth"] = len(i["sectionNames"])
 		i["titleVariants"] = [i["title"]]
-		i["length"] = bookIndex["length"]
+		if "length" in bookIndex:
+			i["length"] = bookIndex["length"]
 		indices[book] = copy.deepcopy(i)
 		return i
 
 	# TODO return a virtual index for shorthands
 
 	return {"error": "Unknown text: '%s'." % book}
+
+
+def get_he_index(he_book):
+	"""
+	Return index information for Hebrew book
+	"""
+	en_book = he_indices.get(he_book)
+	if not en_book:
+		i = db.index.find_one({"heTitleVariants": he_book})
+		if i:
+			en_book = i["title"]
+			he_indices[he_book] = en_book
+	if en_book:
+		return get_index(en_book)
+
+	logger.warning("In get_he_index: Can not find entry for %s", he_book)
+	return {"error": "Unknown Hebrew text: %s" % he_book}
 
 
 def merge_translations(text, sources):
@@ -92,6 +127,9 @@ def merge_translations(text, sources):
 	possible.
 	e.g. [["a", ""], ["", "b", "c"]] becomes ["a", "b", "c"]
 	"""
+	if not (len(text) and len(sources)):
+		return ["", []]
+
 	depth = list_depth(text)
 	if depth > 2:
 		results = []
@@ -191,14 +229,14 @@ def text_from_cur(ref, textCur, context):
 			ref['versionStatus'] = versionStatuses[versionTitles.index(ref['sources'][0])]
 			del ref['sources']
 
- 	return ref
+	return ref
 
 
 def get_text(ref, context=1, commentary=True, version=None, lang=None, pad=True):
 	"""
 	Take a string reference to a segment of text and return a dictionary including
 	the text and other info.
-		* 'context': how many levels of depth above the requet ref should be returned.
+		* 'context': how many levels of depth above the request ref should be returned.
 	  		e.g., with context=1, ask for a verse and receive its surrounding chapter as well.
 	  		context=0 gives just what is asked for.
 		* 'commentary': whether or not to search for and return connected texts as well.
@@ -212,9 +250,12 @@ def get_text(ref, context=1, commentary=True, version=None, lang=None, pad=True)
 		# If ref spans sections, call get_text for each section
 		return get_spanning_text(r)
 
-	skip = r["sections"][0] - 1 if len(r["sections"]) else 0
-	limit = 1
-	chapter_slice = {"_id": 0} if len(r["sectionNames"]) == 1 else {"_id": 0, "chapter": {"$slice": [skip,limit]}}
+	if len(r["sections"]):
+		skip = r["sections"][0] - 1
+		limit = 1
+		chapter_slice = {"_id": 0} if len(r["sectionNames"]) == 1 else {"_id": 0, "chapter": {"$slice": [skip,limit]}}
+	else:
+		chapter_slice = {"_id": 0}
 
 	textCur = heCur = None
 	# pull a specific version of text
@@ -355,7 +396,7 @@ def split_spanning_ref(pRef):
 
 	if len(pRef["sections"]) == depth:
 		# add specificity only if it exists in the original ref
-		
+
 		# add segment specificity to beginning
 		last_segment = get_segment_count_for_ref(refs[0])
 		refs[0] = "%s:%d-%d" % (refs[0], pRef["sections"][-1], last_segment)
@@ -428,17 +469,18 @@ def make_ref_re(ref):
 	'ref' exactly, or more specificly than 'ref'
 	E.g., "Genesis 1" yields an RE that match "Genesis 1" and "Genesis 1:3"
 	"""
+	ref  = norm_ref(ref)
 	pRef = parse_ref(ref)
 	patterns = []
 	refs = list_refs_in_range(ref) if "-" in ref else [ref]
 
-	for ref in refs:
-		patterns.append("%s$" % ref) # exact match
-		patterns.append("%s:" % ref) # more granualar, exact match followed by :
-		if len(pRef["sectionNames"]) == 1 and len(pRef["sections"]) == 0:
-			patterns.append("%s \d" % ref) # special case for extra granularity following space 
+	for r in refs:
+		sections = re.sub("^%s" % pRef["book"], '', r) 
+		patterns.append("%s$" % sections)   # exact match
+		patterns.append("%s:" % sections)   # more granualar, exact match followed by :
+		patterns.append("%s \d" % sections) # extra granularity following space 
 
-	return "^(%s)" % "|".join(patterns)
+	return "^%s(%s)" % (pRef["book"], "|".join(patterns))
 
 
 def get_links(ref, with_text=True):
@@ -585,6 +627,222 @@ def format_note_for_client(note):
 	return com
 
 
+def get_he_mishna_pehmem_regex(title):
+	exp = ur"""(?:^|\s)								# beginning or whitespace
+		(?P<title>{0})								# title
+		\s+											# a space
+		(?:
+		    \u05e4(?:"|\u05f4|'')?                  # Peh (for 'perek') maybe followed by a quote of some sort
+		    |\u05e4\u05e8\u05e7\s*                  # or 'perek' spelled out, followed by space
+		)
+		(?P<num1>									# the first number (1 of 3 styles, below)
+			\p{{Hebrew}}['\u05f3]					# (1: ') single letter, followed by a single quote or geresh
+			|(?=\p{{Hebrew}}+(?:"|\u05f4|'')\p{{Hebrew}}) # (2: ") Lookahead:  At least one letter, followed by double-quote, two single quotes, or gershayim, followed by  one letter
+				\u05ea*(?:"|\u05f4|'')?				# Many Tavs (400), maybe dbl quote
+				[\u05e7-\u05ea]?(?:"|\u05f4|'')?	# One or zero kuf-tav (100-400), maybe dbl quote
+				[\u05d8-\u05e6]?(?:"|\u05f4|'')?	# One or zero tet-tzaddi (9-90), maybe dbl quote
+				[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)															#
+			|(?=\p{{Hebrew}})						# (3: no punc) Lookahead: at least one Hebrew letter
+				\u05ea*								# Many Tavs (400)
+				[\u05e7-\u05ea]?					# One or zero kuf-tav (100-400)
+				[\u05d8-\u05e6]?					# One or zero tet-tzaddi (9-90)
+				[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)
+		)											# end of the num1 group
+		(?:\s+[,:]?\s*|\s*[,:]?\s+|\s*[,:]\s*)		# some type of delimiter - colon, comma, or space, maybe a combo
+		(?:
+			(?:\u05de\u05e9\u05e0\u05d4\s)			# Mishna spelled out, with a space after
+			|(?:\u05de(?:"|\u05f4|'')?)				# or Mem (for 'mishna') maybe followed by a quote of some sort
+		)
+		(?P<num2>									# second number
+			\p{{Hebrew}}['\u05f3]					# (1: ') single letter, followed by a single quote or geresh
+			|(?=\p{{Hebrew}}+(?:"|\u05f4|'')\p{{Hebrew}}) # (2: ") Lookahead:  At least one letter, followed by double-quote, two single quotes, or gershayim, followed by  one letter
+				\u05ea*(?:"|\u05f4|'')?				# Many Tavs (400), maybe dbl quote
+				[\u05e7-\u05ea]?(?:"|\u05f4|'')?	# One or zero kuf-tav (100-400), maybe dbl quote
+				[\u05d8-\u05e6]?(?:"|\u05f4|'')?	# One or zero tet-tzaddi (9-90), maybe dbl quote
+				[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)															#
+			|(?=\p{{Hebrew}})						# (3: no punc) Lookahead: at least one Hebrew letter
+				\u05ea*								# Many Tavs (400)
+				[\u05e7-\u05ea]?					# One or zero kuf-tav (100-400)
+				[\u05d8-\u05e6]?					# One or zero tet-tzaddi (9-90)
+				[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)
+		)											# end of the num2 group
+		(?=\s|$)									# look ahead - either a space or the end of the string
+	""".format(regex.escape(title))
+	return regex.compile(exp, regex.VERBOSE)
+
+
+def get_he_mishna_peh_regex(title):
+	exp = ur"""(?:^|\s)								# beginning or whitespace
+		(?P<title>{0})								# title
+		\s+											# a space
+		(?:
+		    \u05e4(?:"|\u05f4|'')?                  # Peh (for 'perek') maybe followed by a quote of some sort
+		    |\u05e4\u05e8\u05e7\s*                  # or 'perek' spelled out, followed by space
+		)
+		(?P<num1>									# the first number (1 of 3 styles, below)
+			\p{{Hebrew}}['\u05f3]					# (1: ') single letter, followed by a single quote or geresh
+			|(?=\p{{Hebrew}}+(?:"|\u05f4|'')\p{{Hebrew}}) # (2: ") Lookahead:  At least one letter, followed by double-quote, two single quotes, or gershayim, followed by  one letter
+				\u05ea*(?:"|\u05f4|'')?				# Many Tavs (400), maybe dbl quote
+				[\u05e7-\u05ea]?(?:"|\u05f4|'')?	# One or zero kuf-tav (100-400), maybe dbl quote
+				[\u05d8-\u05e6]?(?:"|\u05f4|'')?	# One or zero tet-tzaddi (9-90), maybe dbl quote
+				[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)															#
+			|(?=\p{{Hebrew}})						# (3: no punc) Lookahead: at least one Hebrew letter
+				\u05ea*								# Many Tavs (400)
+				[\u05e7-\u05ea]?					# One or zero kuf-tav (100-400)
+				[\u05d8-\u05e6]?					# One or zero tet-tzaddi (9-90)
+				[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)
+		)											# end of the num1 group
+		(?=\s|$)									# look ahead - either a space or the end of the string
+	""".format(regex.escape(title))
+	return regex.compile(exp, regex.VERBOSE)
+
+
+def get_he_tanach_ref_regex(title):
+	"""
+	todo: this is matching "שם" in the num1 group, because the final letters are interspersed in the range.
+	"""
+	exp = ur"""(?:^|\s)								# beginning or whitespace
+		(?P<title>{0})								# title
+		\s+											# a space
+		(?P<num1>									# the first number (1 of 3 styles, below)
+			\p{{Hebrew}}['\u05f3]					# (1: ') single letter, followed by a single quote or geresh
+			|(?=\p{{Hebrew}}+(?:"|\u05f4|'')\p{{Hebrew}}) # (2: ") Lookahead:  At least one letter, followed by double-quote, two single quotes, or gershayim, followed by  one letter
+				\u05ea*(?:"|\u05f4|'')?				# Many Tavs (400), maybe dbl quote
+				[\u05e7-\u05ea]?(?:"|\u05f4|'')?	# One or zero kuf-tav (100-400), maybe dbl quote
+				[\u05d8-\u05e6]?(?:"|\u05f4|'')?	# One or zero tet-tzaddi (9-90), maybe dbl quote
+				[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)															#
+			|(?=\p{{Hebrew}})						# (3: no punc) Lookahead: at least one Hebrew letter
+				\u05ea*								# Many Tavs (400)
+				[\u05e7-\u05ea]?					# One or zero kuf-tav (100-400)
+				[\u05d8-\u05e6]?					# One or zero tet-tzaddi (9-90)
+				[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)
+		)											# end of the num1 group
+		(?:\s+[,:]?\s*|\s*[,:]?\s+|\.|\s*[,:]\s*|$)	# some type of delimiter - colon, comma, or space, maybe a combo, a single period, or else maybe ref-end
+		(?:											# second number group - optional
+			(?P<num2>								# second number
+				\p{{Hebrew}}['\u05f3]				# (1: ') single letter, followed by a single quote or geresh
+				|(?=\p{{Hebrew}}+(?:"|\u05f4|'')\p{{Hebrew}}) # (2: ") Lookahead:  At least one letter, followed by double-quote, two single quotes, or gershayim, followed by  one letter
+					\u05ea*(?:"|\u05f4|'')?			# Many Tavs (400), maybe dbl quote
+					[\u05e7-\u05ea]?(?:"|\u05f4|'')?	# One or zero kuf-tav (100-400), maybe dbl quote
+					[\u05d8-\u05e6]?(?:"|\u05f4|'')?	# One or zero tet-tzaddi (9-90), maybe dbl quote
+					[\u05d0-\u05d8]?				# One or zero alef-tet (1-9)															#
+				|(?=\p{{Hebrew}})					# (3: no punc) Lookahead: at least one Hebrew letter
+					\u05ea*							# Many Tavs (400)
+					[\u05e7-\u05ea]?				# One or zero kuf-tav (100-400)
+					[\u05d8-\u05e6]?				# One or zero tet-tzaddi (9-90)
+					[\u05d0-\u05d8]?				# One or zero alef-tet (1-9)
+			)?										# end of the num2 group
+			(?=\s|$)								# look ahead - either a space or the end of the string
+		)?
+	""".format(regex.escape(title))
+	return regex.compile(exp, regex.VERBOSE)
+
+
+def get_he_talmud_ref_regex(title):
+	exp = ur"""(?:^|\s)								# beginning or whitespace
+		(?P<title>{0})								# title
+		\s+											# a space
+		(\u05d3[\u05e3\u05e4\u05f3']\s+)?			# Daf, spelled with peh, peh sofit, geresh, or single quote
+		(?P<num1>									# the first number (1 of 3 styles, below)
+			\p{{Hebrew}}['\u05f3]					# (1: ') single letter, followed by a single quote or geresh
+			|(?=\p{{Hebrew}}+(?:"|\u05f4|'')\p{{Hebrew}}) # (2: ") Lookahead:  At least one letter, followed by double-quote, two single quotes, or gershayim, followed by  one letter
+				\u05ea*(?:"|\u05f4|'')?				# Many Tavs (400), maybe dbl quote
+				[\u05e7-\u05ea]?(?:"|\u05f4|'')?	# One or zero kuf-tav (100-400), maybe dbl quote
+				[\u05d8-\u05e6]?(?:"|\u05f4|'')?	# One or zero tet-tzaddi (9-90), maybe dbl quote
+				[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)
+			|(?=\p{{Hebrew}})						# (3: no punc) Lookahead: at least one Hebrew letter
+				\u05ea*								# Many Tavs (400)
+				[\u05e7-\u05ea]?					# One or zero kuf-tav (100-400)
+				[\u05d8-\u05e6]?					# One or zero tet-tzaddi (9-90)
+				[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)
+		)											# end of the num1 group
+		(?P<amud>									# amud indicator
+			[.:]									# a period or a colon, for a or b
+			|[,\s]+			    					# or some space/comma
+			[\u05d0\u05d1]							# followed by an aleph or bet
+		)?											# end of daf indicator
+		(?:\s|$)									# space or end of string
+	""".format(regex.escape(title))
+	return regex.compile(exp, regex.VERBOSE)
+
+
+def parse_he_ref(ref, pad=True):
+	"""
+	Decide what kind of reference we're looking at, then parse it to its parts
+	"""
+	#These refs should be cached, as well
+	#if ref in parsed: 	# and pad?
+	#	return copy.deepcopy(parsed[ref])
+
+	#logger.debug(ref)
+
+	titles = get_titles_in_text(ref, "he")
+
+	if not titles:
+		logger.warning("parse_he_ref(): No titles found in: %s", ref)
+		return {"error": "No titles found in: %s" % ref}
+
+	he_title = max(titles, key=len)  # Assuming that longest title is the best
+	index = get_he_index(he_title)
+
+	if "error" in index:
+		logger.warning("parse_he_ref(): Error in index fo: %s", he_title)
+		return index
+
+	cat = index["categories"][0]
+
+	if cat == "Tanach":
+		reg = get_he_tanach_ref_regex(he_title)
+		match = reg.search(ref)
+	elif cat == "Mishnah":
+		reg = get_he_mishna_pehmem_regex(he_title)
+		match = reg.search(ref)
+		if not match:
+			reg = get_he_mishna_peh_regex(he_title)
+			match = reg.search(ref)
+		if not match:
+			reg = get_he_tanach_ref_regex(he_title)
+			match = reg.search(ref)
+	elif cat == "Talmud":
+		reg = get_he_mishna_pehmem_regex(he_title) #try peh-mem form first, since it's stricter
+		match = reg.search(ref)
+		if match: #if it matches, we need to force a mishnah result
+			he_title = u"משנה" + " " + he_title
+			index = get_he_index(he_title)
+		else:
+			reg = get_he_talmud_ref_regex(he_title)
+			match = reg.search(ref)
+	else:  # default
+		return {"error": "No support for Hebrew " + cat + " references: " + ref}
+
+	if not match:
+		logger.warning("parse_he_ref(): Can not match: %s", ref)
+		return {"error": "Match Miss: %s" % ref}
+
+	eng_ref = index["title"]
+	gs = match.groupdict()
+
+	if u"שם" in gs.get('num1'): # todo: handle ibid refs or fix regex so that this doesn't pass
+		return {"error": "%s not supported" % u"שם"}
+
+	if gs.get('num1') is not None:
+		gs['num1'] = decode_hebrew_numeral(gs['num1'])
+		eng_ref += "." + str(gs['num1'])
+
+	if gs.get('num2') is not None:
+		gs['num2'] = decode_hebrew_numeral(gs['num2'])
+		eng_ref += "." + str(gs['num2'])
+	elif gs.get('amud') is not None:
+		if u"\u05d0" in gs['amud'] or "." in gs['amud']:
+			eng_ref += "a"
+		elif u"\u05d1" in gs['amud'] or ":" in gs['amud']:
+			eng_ref += "b"
+
+
+	logger.debug("parse_he_ref: " + ref + " -> " + eng_ref)
+	return parse_ref(eng_ref, pad)
+
+
 def memoize_parse_ref(func):
 	"""
 	Decorator for parse_ref to cache results in memory
@@ -593,7 +851,11 @@ def memoize_parse_ref(func):
 	"""
 	def memoized_parse_ref(ref, pad=True):
 		try:
-			ref = ref.decode('utf-8').replace(u"–", "-").replace(":", ".").replace("_", " ")
+			ref = ref.strip()
+			if is_hebrew(ref):
+				ref = ref.replace(u"–", "-").replace("_", " ")  # don't replace : in Hebrew, where it can indicate amud
+			else:
+				ref = ref.decode('utf-8').replace(u"–", "-").replace(":", ".").replace("_", " ")
 		except UnicodeEncodeError, e:
 			return {"error": "UnicodeEncodeError: %s" % e}
 		except AttributeError, e:
@@ -643,6 +905,10 @@ def parse_ref(ref, pad=True):
 
 	todo: handle comma in refs like: "Me'or Einayim, 24"
 	"""
+#	logger.debug("In parse_ref. Ref: %s", ref)
+	if is_hebrew(ref):
+		return parse_he_ref(ref, pad)
+
 	pRef = {}
 
 	# Split into range start and range end (if any)
@@ -650,6 +916,8 @@ def parse_ref(ref, pad=True):
 	if len(toSplit) > 2:
 		pRef["error"] = "Couldn't understand ref (too many -'s)"
 		return pRef
+
+	toSplit = [s.strip() for s in toSplit]
 
 	# Get book
 	base = toSplit[0]
@@ -741,7 +1009,9 @@ def parse_ref(ref, pad=True):
 
 	pRef["next"] = next_section(pRef)
 	pRef["prev"] = prev_section(pRef)
-	pRef["ref"]  = make_ref(pRef)
+	pRef["ref"] = make_ref(pRef)
+
+#	logger.debug(pRef)
 
 	return pRef
 
@@ -751,9 +1021,12 @@ def subparse_talmud(pRef, index, pad=True):
 	Special sub method for parsing Talmud references,
 	allowing for Daf numbering "2a", "2b", "3a" etc.
 
-	This function returns the first section as an int which correponds
+	This function returns the first section as an int which corresponds
 	to how the text is stored in the DB,
 	e.g. 2a = 3, 2b = 4, 3a = 5.
+
+	for a sides: (daf * 2) - 1 = DB index
+	for b sides: (daf * 2) = DB index
 
 	get_text will transform these ints back into daf strings
 	before returning to the client.
@@ -947,7 +1220,7 @@ def daf_to_section(daf):
 
 def section_to_daf(section, lang="en"):
 	"""
-	Trasnforms a section number to its corresponding daf string,
+	Transforms a section number to its corresponding daf string,
 	in English or in Hebrew.
 	"""
 	section += 1
@@ -978,7 +1251,9 @@ def norm_ref(ref, pad=False, context=0):
 		e.g., with context=1, "Genesis 4:5" -> "Genesis 4"
 	"""
 	pRef = parse_ref(ref, pad=pad)
-	if "error" in pRef: return False
+	if "error" in pRef:
+		logger.error("norm_ref: Could not parse ref: %s - %s", ref, pRef['error'])
+		return False
 	if context:
 		pRef["sections"] = pRef["sections"][:pRef["textDepth"]-context]
 		pRef["toSections"] = pRef["sections"][:pRef["textDepth"]-context]
@@ -1040,7 +1315,7 @@ def url_ref(ref):
 
 def top_section_ref(ref):
 	"""
-	Returns a ref (string) that corrsponds to the highest level section above the ref passed.
+	Returns a ref (string) that corresponds to the highest level section above the ref passed.
 	refs with no sections specified are padded to 1
 
 	e.g., Job 4:5 -> Job 4, Rashi on Genesis 1:2:3 -> Rashi on Genesis 1
@@ -1067,7 +1342,7 @@ def section_level_ref(ref):
 	pRef = parse_ref(ref, pad=True)
 	if "error" in pRef:
 		return pRef
-	
+
 	pRef["sections"] = pRef["sections"][:pRef["textDepth"]-1]
 	pRef["toSections"] = pRef["toSections"][:pRef["textDepth"]-1]
 
@@ -1106,7 +1381,7 @@ def save_text(ref, text, user, **kwargs):
 		# Have this (book / version / language)
 
 		# Only allow staff to edit locked texts
-		if existing.get("status", "") == "locked" and not is_user_staff(user): 
+		if existing.get("status", "") == "locked" and not is_user_staff(user):
 			return {"error": "This text has been locked against further edits."}
 
 		# Pad existing version if it has fewer chapters
@@ -1159,6 +1434,7 @@ def save_text(ref, text, user, **kwargs):
 		record_text_change(ref, text["versionTitle"], text["language"], text["text"], user, **kwargs)
 		db.texts.save(existing)
 
+		text_id = existing["_id"]
 		del existing["_id"]
 		if 'revisionDate' in existing:
 			del existing['revisionDate']
@@ -1203,25 +1479,29 @@ def save_text(ref, text, user, **kwargs):
 
 		record_text_change(ref, text["versionTitle"], text["language"], text["text"], user, **kwargs)
 
+		saved_text = text["text"]
 		del text["text"]
-		db.texts.update({"title": pRef["book"], "versionTitle": text["versionTitle"], "language": text["language"]}, text, True, False)
+		text_id = db.texts.insert(text)
+		text["text"] = saved_text
 
 		response = text
 
 	# Finish up for both existing and new texts
+
+	# count available segments of text
+	if kwargs.get("count_after", True):
+		summaries.update_summaries_on_change(pRef["book"])
 
 	# Commentaries generate links to their base text automatically
 	if pRef["type"] == "Commentary":
 		add_commentary_links(ref, user, **kwargs)
 
 	# scan text for links to auto add
-	add_links_from_text(ref, text, user, **kwargs)
-
-	# count available segments of text
-	if kwargs.get("count_after", True):
-		summaries.update_summaries_on_change(pRef["book"])
+	add_links_from_text(ref, text, text_id, user, **kwargs)
 
 	# Add this text to a queue to be indexed for search
+	from sefaria.search import add_ref_to_index_queue
+	from sefaria.settings import SEARCH_INDEX_ON_SAVE
 	if SEARCH_INDEX_ON_SAVE and kwargs.get("index_after", True):
 		add_ref_to_index_queue(ref, response["versionTitle"], response["language"])
 
@@ -1264,7 +1544,7 @@ def validate_text(text, ref):
 
 def set_text_version_status(title, lang, version, status=None):
 	"""
-	Sets the status field of an existing text version. 
+	Sets the status field of an existing text version.
 	"""
 	title   = title.replace("_", " ")
 	version = version.replace("_", " ")
@@ -1298,9 +1578,18 @@ def save_link(link, user, **kwargs):
 		- refs - array of connected refs
 		- type
 		- anchorText - relative to the first?
+	Key word args:
+		auto: True if link is generated by an automatic process
+		generated_by: text with the name of the automatic process
+
 	"""
 	if not validate_link(link):
 		return {"error": "Error validating link."}
+
+	auto = kwargs.get('auto', False)
+	link["auto"] = 1 if auto else 0
+	link["generated_by"] = kwargs.get("generated_by", None)
+	link["source_text_oid"] = kwargs.get("source_text_oid", None)
 
 	link["refs"] = [norm_ref(link["refs"][0]), norm_ref(link["refs"][1])]
 
@@ -1312,18 +1601,56 @@ def save_link(link, user, **kwargs):
 		objId = ObjectId(link["_id"])
 		link["_id"] = objId
 	else:
-		# Don't bother saving a connection that already exists (updates should occur with an _id)
-		existing = db.links.find_one({"refs": link["refs"], "type": link["type"]})
-		if existing:
+		# Don't bother saving a connection that already exists, or that has a more precise link already
+		samelink = db.links.find_one({"refs": link["refs"]})
+
+		if samelink and not auto and link["type"] and not samelink["type"]:
+			samelink["type"] = link["type"]
+			link = samelink
+			objId = ObjectId(link["_id"])
+			link["_id"] = objId
+
+		elif samelink:
+			logger.debug("save_link: Same link exists: " + samelink["refs"][1])
 			return {"error": "This connection already exists. Try editing instead."}
+
 		else:
-			# this is a new link
-			objId = None
+			preciselink = db.links.find_one(
+				{'$and':
+					[
+						{'refs': link["refs"][0]},
+						{'refs':
+							{'$regex': make_ref_re(link["refs"][1])}
+						}
+					]
+				}
+			)
+
+			if preciselink:
+				logger.debug("save_link: More specific link exists: " + link["refs"][1] + " and " + preciselink["refs"][1])
+				return {"error": "A more precise link already exists: " + preciselink["refs"][1]}
+			else:
+			# this is a good new link
+				objId = None
 
 	db.links.save(link)
 	record_obj_change("link", {"_id": objId}, link, user, **kwargs)
 
+	logger.debug("save_link: Saved " + link["refs"][0] + " <-> " + link["refs"][1])
+
 	return format_link_for_client(link, link["refs"][0], 0)
+
+
+def save_link_batch(links, user, **kwargs):
+	"""
+	Saves a batch of link objects.
+
+	Returns a list of return objects for each link
+	"""
+	res = []
+	for link in links:
+		res.append(save_link(link, user, **kwargs))
+	return res
 
 
 def validate_link(link):
@@ -1396,10 +1723,12 @@ def add_commentary_links(ref, user, **kwargs):
 			"type": "commentary",
 			"anchorText": ""
 		}
-		save_link(link, user, **kwargs)
+		save_link(link, user, auto=True, generated_by="add_commentary_links", **kwargs)
 
 	elif len(text["sections"]) == (len(text["sectionNames"]) - 1):
-		# this is single group of comments
+		# This means that the text (and it's corresponding ref) being posted has the amount of sections like the parent text
+		# (the text being commented on) so this is single group of comments on the lowest unit of the parent text.
+		# and we simply iterate and create a link for each existing one to point to the same unit of parent text
 		length = max(len(text["text"]), len(text["he"]))
 		for i in range(length):
 				link = {
@@ -1407,34 +1736,55 @@ def add_commentary_links(ref, user, **kwargs):
 					"type": "commentary",
 					"anchorText": ""
 				}
-				save_link(link, user, **kwargs)
+				save_link(link, user, auto=True, generated_by="add_commentary_links", **kwargs)
 
-	else:
-		# this is a larger group of comments, recur on each section
+	elif len(text["sections"]) > 0:
+		# any other case where the posted ref sections do not match the length of the parent texts sections
+		# this is a larger group of comments meaning it needs to be further broken down
+		# in order to be able to match the commentary to the basic parent text units,
+		# recur on each section
 		length = max(len(text["text"]), len(text["he"]))
+		for i in range(length):
+			add_commentary_links("%s:%d" % (ref, i+1), user)
+	else:
+		#This is a special case of the above, where the sections length is 0 and that means this is
+		# a whole text that has been posted. For  this we need a better way than get_text() to get the correct length of
+		# highest order section counts.
+		# We use the counts document for that.
+		text_counts = counts.count_texts(ref)
+		length = len(text_counts["counts"])
 		for i in range(length):
 			add_commentary_links("%s:%d" % (ref, i+1), user)
 
 
-def add_links_from_text(ref, text, user, **kwargs):
+def add_links_from_text(ref, text, text_id, user, **kwargs):
 	"""
 	Scan a text for explicit references to other texts and automatically add new links between
 	ref and the mentioned text.
 
 	text["text"] may be a list of segments, an individual segment, or None.
+
+	Lev - added return on 13 July 2014
 	"""
 	if not text or "text" not in text:
 		return
 	elif isinstance(text["text"], list):
+		links = []
 		for i in range(len(text["text"])):
 			subtext = copy.deepcopy(text)
 			subtext["text"] = text["text"][i]
-			add_links_from_text("%s:%d" % (ref, i+1), subtext, user, **kwargs)
+			single = add_links_from_text("%s:%d" % (ref, i + 1), subtext, text_id, user, **kwargs)
+			links += single
+		return links
 	elif isinstance(text["text"], basestring):
+		links = []
 		matches = get_refs_in_text(text["text"])
 		for mref in matches:
 			link = {"refs": [ref, mref], "type": ""}
-			save_link(link, user, **kwargs)
+			link = save_link(link, user, auto=True, generated_by="add_links_from_text", source_text_oid=text_id, **kwargs)
+			if "error" not in link:
+				links += [link]
+		return links
 
 
 def save_index(index, user, **kwargs):
@@ -1442,7 +1792,7 @@ def save_index(index, user, **kwargs):
 	Save an index record to the DB.
 	Index records contain metadata about texts, but not the text itself.
 	"""
-	global indices, texts_titles_cache, texts_titles_json
+	global parsed, indices, texts_titles_cache, texts_titles_json
 	index = norm_index(index)
 
 	validation = validate_index(index)
@@ -1452,6 +1802,12 @@ def save_index(index, user, **kwargs):
 	# Ensure primary title is listed among title variants
 	if index["title"] not in index["titleVariants"]:
 		index["titleVariants"].append(index["title"])
+
+	if "heTitle" in index:
+		if "heTitleVariants" not in index:
+			index["heTitleVariants"] = index["heTitle"]
+		elif index["heTitle"] not in index["titleVariants"]:
+			index["heTitleVariants"].append(index["heTitle"])
 
 	title = index["title"]
 	# Handle primary title change
@@ -1476,6 +1832,8 @@ def save_index(index, user, **kwargs):
 		index["maps"] = []
 	for i in range(len(index["maps"])):
 		nref = norm_ref(index["maps"][i]["to"])
+		if db.index.find_one({"titleVariants": nref}):
+			return {"error": "'%s' cannot be a shorthand name: a text with this title already exisits." % nref }
 		if not nref:
 			return {"error": "Couldn't understand text reference: '%s'." % index["maps"][i]["to"]}
 		index["maps"][i]["to"] = nref
@@ -1483,13 +1841,19 @@ def save_index(index, user, **kwargs):
 	# now save with normilzed maps
 	db.index.save(index)
 
+	summaries.update_summaries_on_change(title, old_ref=old_title, recount=bool(old_title)) # only recount if the title changed
+
 	# invalidate in-memory cache
 	for variant in index["titleVariants"]:
-		if variant in indices:
-			del indices[variant]
+		for title in indices.keys():
+			if title.startswith(variant):
+				print "Deleting index + " + title
+				del indices[title]
+	for ref in parsed.keys():
+		if ref.startswith(index["title"]):
+			print "Deleting parsed" + ref
+			del parsed[ref]
 	texts_titles_cache = texts_titles_json = None
-
-	summaries.update_summaries_on_change(title, old_ref=old_title, recount=bool(old_title)) # only recount if the title changed
 
 	del index["_id"]
 	return index
@@ -1692,15 +2056,15 @@ def update_version_title_in_history(old, new, text_title, language):
 def merge_text_versions(version1, version2, text_title, language):
 	"""
 	Merges the contents of two distinct text versions.
-	version2 is merged into version1 then deleted.  
+	version2 is merged into version1 then deleted.
 	Preference is giving to version1 - if both versions contain content for a given segment,
 	only the content of version1 will be retained.
 
-	History entries are rewritten for version2. 
+	History entries are rewritten for version2.
 	NOTE: the history of that results will be incorrect for any case where the content of
 	version2 is overwritten - the history of those overwritten edits will remain.
 	To end with a perfectly accurate history, history items for segments which have been overwritten
-	would need to be identified and deleted. 
+	would need to be identified and deleted.
 	"""
 	v1 = db.texts.find_one({"title": text_title, "versionTitle": version1, "language": language})
 	if not v1:
@@ -1835,15 +2199,46 @@ def downsize_jagged_array(text):
 	return new_text
 
 
+def delete_text(text):
+	"""
+	Fully deletes a text from Sefaria by:
+	- Deleting the index document
+	- Deleting all text documents
+	- Deleting the counts document
+	- Deleting all links pointing to this text
+
+	If 'text' is the name of a commentator, delete_text will be called recursively
+	for each commentary text that exists.
+	"""
+	i = get_index(text)
+
+	if "error" in i:
+		return i
+
+	if i["categories"][0] == "Commentary" and "commentator" not in i:
+		# This is the name of a Commentator alone (e.g., "Rashi")
+		# delete all texts
+		texts = db.texts.find({"title": {"$regex": "^%s on " % i["title"] }}).distinct("title")
+		for t in texts:
+			delete_text(t)
+	else:
+		db.links.remove({"refs": {"$regex": make_ref_re(text)}})
+		db.texts.remove({"title": text})
+		db.counts.remove({"title": text})
+
+	db.index.remove({"title": text})
+
+
 def reset_texts_cache():
 	"""
 	Resets caches that only update when text index information changes.
 	"""
-	global indices, parsed, texts_titles_cache, texts_titles_json, toc_cache
+	global indices, parsed, texts_titles_cache, he_texts_titles_cache, texts_titles_json, toc_cache
 	indices = {}
 	parsed = {}
 	toc_cache = None
 	texts_titles_cache = None
+	he_texts_titles_cache = None
 	texts_titles_json = None
 	delete_template_cache('texts_list')
 	delete_template_cache('leaderboards')
@@ -1854,23 +2249,88 @@ def get_refs_in_text(text):
 	"""
 	Returns a list of valid refs found within text.
 	"""
-	titles = get_titles_in_text(text)
+	lang = 'he' if is_hebrew(text) else 'en'
+
+	titles = get_titles_in_text(text, lang)
 	if not titles:
 		return []
-	reg = "\\b(?P<ref>"
-	reg += "(" + "|".join([re.escape(title) for title in titles]) + ")"
-	reg += " \d+([ab])?([ .:]\d+)?([ .:]\d+)?(-\d+([ab])?([ .:]\d+)?)?" + ")\\b"
-	reg = re.compile(reg)
+
+	if lang == "en":
+		reg = "\\b(?P<ref>"
+		reg += "(" + "|".join([re.escape(title) for title in titles]) + ")"
+		reg += " \d+([ab])?([ .:]\d+)?([ .:]\d+)?(-\d+([ab])?([ .:]\d+)?)?" + ")\\b"
+		reg = re.compile(reg)
+	elif lang == "he":
+		title_string = "|".join([re.escape(t) for t in titles])
+		#Hebrew Unicode page: http://www.unicode.org/charts/PDF/U0590.pdf
+		#todo: handle Ayin before Resh cases.
+		#todo: This doesn't do ranges.  Do we see those in the wild?
+		#todo: verify that open and closing parens are of the same type, so as not to fooled by (} or {)
+		reg = ur"""(?<=										# look behind for opening brace
+				[({{]										# literal '(', brace,
+				[^}})]*										# anything but a closing ) or brace
+			)
+			(?P<ref>										# Capture the whole match as 'ref'
+				({0})										# Any one book title, (Inserted with format(), below)
+				\s+											# a space
+				(\u05d3[\u05e3\u05e4\u05f3']\s+)?			# Daf, spelled with peh, peh sofit, geresh, or single quote
+				(?:\u05e4(?:"|\u05f4|'')?)?				# Peh (for 'perek') maybe followed by a quote of some sort
+				(?P<num1>									# the first number (1 of 3 styles, below)
+					(?=\p{{Hebrew}}+(?:"|\u05f4|'')\p{{Hebrew}}) # (2: ") Lookahead:  At least one letter, followed by double-quote, two single quotes, or gershayim, followed by  one letter
+						\u05ea*(?:"|\u05f4|'')?				# Many Tavs (400), maybe dbl quote
+						[\u05e7-\u05ea]?(?:"|\u05f4|'')?	# One or zero kuf-tav (100-400), maybe dbl quote
+						[\u05d8-\u05e6]?(?:"|\u05f4|'')?	# One or zero tet-tzaddi (9-90), maybe dbl quote
+						[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)															#
+					|(?=\p{{Hebrew}})						# (3: no punc) Lookahead: at least one Hebrew letter
+						\u05ea*								# Many Tavs (400)
+						[\u05e7-\u05ea]?					# One or zero kuf-tav (100-400)
+						[\u05d8-\u05e6]?					# One or zero tet-tzaddi (9-90)
+						[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)
+					|\p{{Hebrew}}['\u05f3]					# (1: ') single letter, followed by a single quote or geresh
+				)\s*										# end of the num1 group, maybe space
+				[.:]?										# maybe a . for gemara refs or a : for tanach or gemara refs
+				[,\s]*			    						# maybe a comma, maybe a space, maybe both
+				(?:
+					(?:\u05de\u05e9\u05e0\u05d4\s)			# Mishna spelled out, with a space after
+					|(?:\u05de(?:"|\u05f4|'')?)				# or Mem (for 'mishna') maybe followed by a quote of some sort
+				)?
+				(?P<num2>									# second number - optional
+					(?=\p{{Hebrew}}+(?:"|\u05f4|'')\p{{Hebrew}}) # (2: ") Lookahead:  At least one letter, followed by double-quote, two single quotes, or gershayim, followed by  one letter
+						\u05ea*(?:"|\u05f4|'')?				# Many Tavs (400), maybe dbl quote
+						[\u05e7-\u05ea]?(?:"|\u05f4|'')?	# One or zero kuf-tav (100-400), maybe dbl quote
+						[\u05d8-\u05e6]?(?:"|\u05f4|'')?	# One or zero tet-tzaddi (9-90), maybe dbl quote
+						[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)															#
+					|(?=\p{{Hebrew}})						# (3: no punc) Lookahead: at least one Hebrew letter
+						\u05ea*								# Many Tavs (400)
+						[\u05e7-\u05ea]?					# One or zero kuf-tav (100-400)
+						[\u05d8-\u05e6]?					# One or zero tet-tzaddi (9-90)
+						[\u05d0-\u05d8]?					# One or zero alef-tet (1-9)
+					|\p{{Hebrew}}['\u05f3]					# (1: ') single letter, followed by a single quote or geresh
+				)?[.:]?										# end of the num2 group, maybe a . or : for gemara refs
+			)												# end of ref capture
+			(?=												# look ahead for closing brace
+				[^({{]*										# match of anything but an opening '(' or brace
+				[)}}]										# zero-width: literal ')' or brace
+			)
+		""".format(title_string)
+
+		reg = regex.compile(reg, regex.VERBOSE)
+
 	matches = reg.findall(text)
 	refs = [match[0] for match in matches]
+	if len(refs) > 0:
+		for ref in refs:
+			logger.debug("get_refs_in_text: " + ref)
 	return refs
 
 
-def get_titles_in_text(text):
+def get_titles_in_text(text, lang="en"):
 	"""
 	Returns a list of known text titles that occur within text.
+	todo: Verify that this works for a Hebrew text
 	"""
-	all_titles = get_text_titles()
+
+	all_titles = get_text_titles({}, lang)
 	matched_titles = [title for title in all_titles if text.find(title) > -1]
 
 	return matched_titles
@@ -1894,7 +2354,17 @@ def get_counts(ref):
 	return c
 
 
-def get_text_titles(query={}):
+
+def get_text_titles(query={}, lang="en"):
+	if lang == "en":
+		return get_en_text_titles(query)
+	elif lang == "he":
+		return get_he_text_titles(query)
+	else:
+		logger.error("get_text_titles: Unsupported Language: %s", lang)
+
+
+def get_en_text_titles(query={}):
 	"""
 	Return a list of all known text titles, including title variants and shorthands/maps.
 	Optionally take a query to limit results.
@@ -1912,6 +2382,20 @@ def get_text_titles(query={}):
 		texts_titles_cache = titles
 
 	return texts_titles_cache
+
+
+def get_he_text_titles(query={}):
+	global he_texts_titles_cache
+
+	if query or not he_texts_titles_cache:
+		titles = db.index.find(query).distinct("heTitleVariants")
+
+		if query:
+			return titles
+
+		he_texts_titles_cache = titles
+
+	return he_texts_titles_cache
 
 
 def get_text_titles_json():
@@ -1970,4 +2454,3 @@ def grab_section_from_text(sections, text, toSections=None):
 		return ""
 
 	return text
-

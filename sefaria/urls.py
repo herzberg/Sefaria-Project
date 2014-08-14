@@ -74,6 +74,11 @@ urlpatterns += patterns('reader.views',
     (r'^search/?$', 'search'),
 )
 
+# Dashboard Page
+urlpatterns += patterns('reader.views',
+    (r'^dashboard/?$', 'dashboard'),
+)
+
 # Source Sheets
 urlpatterns += patterns('sheets.views',
     (r'^sheets/?$', 'sheets_list'),
@@ -113,8 +118,11 @@ urlpatterns += patterns('reader.views',
 
 # Profiles & Settings
 urlpatterns += patterns('reader.views',
-    (r'^contributors/(?P<username>[^/]+)(/(?P<page>\d+))?$', 'user_profile'),
-    (r'^account/settings/?$', 'account_settings'),
+    (r'^my/profile', 'my_profile'),
+    (r'^profile/(?P<username>[^/]+)(/(?P<page>\d+))?$', 'user_profile'),
+    (r'^contributors/(?P<username>[^/]+)(/(?P<page>\d+))?$', 'profile_redirect'),
+    (r'^settings/account?$', 'account_settings'),
+    (r'^settings/profile?$', 'edit_profile'),
     (r'^api/profile$', 'profile_api'),
 )
 
@@ -127,6 +135,13 @@ urlpatterns += patterns('reader.views',
 # Messages API
 urlpatterns += patterns('reader.views',
     (r'^api/messages/?$', 'messages_api'),
+)
+
+# Following API
+urlpatterns += patterns('reader.views',
+    (r'^api/(?P<action>(follow|unfollow))/(?P<uid>\d+)$', 'follow_api'),
+    (r'^api/(?P<kind>(followers|followees))/(?P<uid>\d+)$', 'follow_list_api'),
+
 )
 
 # Partners 
@@ -150,7 +165,7 @@ urlpatterns += patterns('reader.views',
     url(r'^$', 'splash', name="home"),
     (r'^splash/?$', 'splash'),
     (r'^metrics/?$', 'metrics'),
-    (r'^(contribute|educators|developers|faq|donate|translation-guidelines|transliteration-guidelines|even-haezer-guidelines|related-projects|jobs|terms|privacy-policy|meetup1|meetup2)/?$', 'serve_static'),
+    (r'^(contribute|educators|developers|faq|donate|translation-guidelines|transliteration-guidelines|even-haezer-guidelines|related-projects|jobs|terms|privacy-policy|meetup1|meetup2|random-walk-through-torah)/?$', 'serve_static'),
 )
 
 # Redirect to Forum
@@ -167,7 +182,8 @@ urlpatterns += patterns('sefaria.views',
 # Admin 
 urlpatterns += patterns('', 
     (r'^admin/reset/cache', 'sefaria.views.reset_cache'),
-    (r'^admin/reset/counts', 'sefaria.views.reset_counts'),
+    (r'^admin/rebuild/counts-toc', 'sefaria.views.rebuild_counts_and_toc'),
+    (r'^admin/rebuild/counts', 'sefaria.views.reset_counts'),
     (r'^admin/rebuild/toc', 'sefaria.views.rebuild_toc'),
     (r'^admin/save/toc', 'sefaria.views.save_toc'),
     (r'^admin/?', include(admin.site.urls)),

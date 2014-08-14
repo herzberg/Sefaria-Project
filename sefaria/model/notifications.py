@@ -6,25 +6,24 @@ Writes to MongoDB Collection: notifications
 import copy
 import os
 import sys
-import simplejson as json
 from datetime import datetime
-from pprint import pprint
+
+import simplejson as json
 from bson.objectid import ObjectId
 
+
+
 # To allow these files to be run directly from command line (w/o Django shell)
+
 os.environ['DJANGO_SETTINGS_MODULE'] = "settings"
 p = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, p)
 sys.path.insert(0, p + "/sefaria")
 
 from django.template.loader import render_to_string
-from django.core.mail import EmailMultiAlternatives
-from django.contrib.auth.models import User
 
-from database import db
-from util import user_name, strip_tags
-from users import UserProfile
-
+from sefaria.system.database import db
+from sefaria.utils.users import user_name
 
 class Notification(object):
 	def __init__(self, uid=None, date=None, obj=None, _id=None):
@@ -59,6 +58,12 @@ class Notification(object):
 		self.type               = "message"
 		self.content["message"] = message
 		self.content["sender"]  = sender_id
+		return self
+
+	def make_follow(self, follower_id=None):
+		"""Make this Notification for a new Follow event"""
+		self.type               = "follow"
+		self.content["follower"]  = follower_id
 		return self
 
 	def mark_read(self, via="site"):
@@ -154,44 +159,6 @@ class NotificationSet(object):
 		return "".join(html)
 
 
-def unread_notifications_count_for_user(uid):
-	"""Returns the number of unread notifcations belonging to user uid"""
-	return db.notifications.find({"uid": uid, "read": False}).count()
 
-
-def email_unread_notifications(timeframe):
-	"""
-	Looks for all unread notifcations and sends each user one email with a summary.
-	Marks any sent notifications as "read".
-
-	timeframe may be: 
-	* 'daily'  - only send to users who have the daily email setting
-	* 'weekly' - only send to users who have the weekly email setting
-	* 'all'    - send all notifications
-	"""
-	users = db.notifications.find({"read": False}).distinct("uid")
-
-	for uid in users:
-		profile = UserProfile(uid)
-		if profile.settings["email_notifications"] != timeframe and timeframe != 'all':
-			continue
-		notifications = NotificationSet().unread_for_user(uid)
-		try:
-			user = User.objects.get(id=uid)
-		except User.DoesNotExist:
-			continue
-
-		message_html = render_to_string("email/notifications_email.html", { "notifications": notifications, "recipient": user.first_name })
-		#message_text = strip_tags(message_html)
-		subject      = "New Activity on Sefaria from %s" % notifications.actors_string()
-		from_email   = "The Sefaria Project <hello@sefaria.org>"
-		to           = user.email
-
-		msg = EmailMultiAlternatives(subject, message_html, from_email, [to])
-		msg.content_subtype = "html"  # Main content is now text/html
-		#msg.attach_alternative(message_text, "text/plain")
-		msg.send()
-
-		notifications.mark_read(via="email")
 
 

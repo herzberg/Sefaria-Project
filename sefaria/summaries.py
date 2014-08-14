@@ -5,11 +5,10 @@ summaries.py - create and manage Table of Contents document for all texts
 Writes to MongoDB Collection: summaries
 """
 from datetime import datetime
-from pprint import pprint
 
 import texts
 import counts
-from database import db
+from sefaria.system.database import db
 
 toc_cache = []
 
@@ -26,7 +25,17 @@ order = [
 			"Deuteronomy",
 		"Prophets",
 		"Writings",
-	'Commentary',
+		"Targum",
+			'Onkelos Genesis',
+			'Onkelos Exodus',
+			'Onkelos Leviticus',
+			'Onkelos Numbers',
+			'Onkelos Deuteronomy',
+			'Targum Jonathan on Genesis',
+			'Targum Jonathan on Exodus',
+			'Targum Jonathan on Leviticus',
+			'Targum Jonathan on Numbers',
+			'Targum Jonathan on Deuteronomy',
 	"Mishnah",
 		"Seder Zeraim", 
 		"Seder Moed", 
@@ -78,22 +87,13 @@ order = [
 	"Kabbalah",
 	'Liturgy',
 		'Siddur',
+		'Piyutim',
 	'Philosophy', 
 	'Chasidut',
 	'Musar',
 	'Responsa', 
 	'Elucidation', 
 	'Other',
-			'Onkelos Genesis',
-			'Onkelos Exodus',
-			'Onkelos Leviticus',
-			'Onkelos Numbers',
-			'Onkelos Deuteronomy',
-			'Targum Jonathan on Genesis',
-			'Targum Jonathan on Exodus',
-			'Targum Jonathan on Leviticus',
-			'Targum Jonathan on Numbers',
-			'Targum Jonathan on Deuteronomy',
 ]
 
 def get_toc():
@@ -121,6 +121,8 @@ def save_toc(toc):
 	global toc_cache
 	toc_cache = toc
 	texts.delete_template_cache("texts_list")
+	texts.delete_template_cache("texts_dashboard")
+
 
 
 def get_toc_from_db():
@@ -158,6 +160,7 @@ def update_table_of_contents():
 		if i["categories"][0] not in order:
 			i["categories"].insert(0, "Other")
 		node = get_or_make_summary_node(toc, i["categories"])
+		#the toc "contents" attr is returned above so for each text appends the counts and index info
 		text = add_counts_to_index(i)
 		node.append(text)
 
@@ -166,7 +169,13 @@ def update_table_of_contents():
 	commentary_texts = texts.get_commentary_texts_list()
 	for c in commentary_texts:
 		i = texts.get_index(c)
-		node = get_or_make_summary_node(toc, i["categories"])
+		#TODO: duplicate index records where one is a commentary and another is not labeled as one can make this crash.
+		#this fix takes care of the crash.
+		if len(i["categories"]) >= 1 and i["categories"][0] == "Commentary":
+			cats = i["categories"][1:2] + ["Commentary"] + i["categories"][2:]
+		else:
+			cats = i["categories"][0:1] + ["Commentary"] + i["categories"][1:]
+		node = get_or_make_summary_node(toc, cats)
 		text = add_counts_to_index(i)
 		node.append(text)
 
@@ -266,6 +275,9 @@ def add_counts_to_index(text):
 	if count and "percentAvailable" in count:
 		text["percentAvailable"] = count["percentAvailable"]
 
+	if count and "estimatedCompleteness" in count:
+		text["isSparse"] = max(count["estimatedCompleteness"]['he']['isSparse'], count["estimatedCompleteness"]['en']['isSparse']) 
+
 	text["availableCounts"] = counts.make_available_counts_dict(text, count)
 
 	return text
@@ -304,6 +316,43 @@ def add_counts_to_category(cat, parents=[]):
 			cat["num_texts"] += 1
 
 
+def node_sort_key(a):
+	"""
+	Sort function for texts/categories per below.
+	"""
+	if "category" in a:
+		try:
+			return order.index(a["category"])
+		except ValueError:
+			# If there is a text with the exact name as this category
+			# (e.g., "Bava Metzia" as commentary category)
+			# sort by text's order
+			i = db.index.find_one({"title": a["category"]})
+			if i and "order" in i:
+				return i["order"][-1]
+			else:
+				return 'zz' + a["category"]
+	elif "title" in a:
+		try:
+			return order.index(a["title"])
+		except ValueError:
+			if "order" in a:
+				return a["order"][-1]
+			else:
+				return a["title"]
+
+	return None
+
+
+def node_sort_sparse(a):
+	if "category" in a: # Category - sort to top
+		score = -4
+	else:
+		score = -a.get('isSparse', 1)
+
+	return score
+
+
 def sort_toc_node(node, recur=False):
 	"""
 	Sort the texts and categories in node according to:
@@ -313,32 +362,8 @@ def sort_toc_node(node, recur=False):
 
 	If 'recur', call sort_toc_node on each category in 'node' as well.
 	"""
-	def node_sort_key(a):
-		if "category" in a:
-			print a["category"]
-			try:
-				return order.index(a["category"])
-			except ValueError:
-				# If there is a text with the exact name as this category
-				# (e.g., "Bava Metzia" as commentary category)
-				# sort by text's order
-				i = db.index.find_one({"title": a["category"]})
-				if i and "order" in i:
-					return i["order"][-1]
-				else:
-					return a["category"]
-		elif "title" in a:
-			try:
-				return order.index(a["title"])
-			except ValueError:
-				if "order" in a:
-					return a["order"][-1]
-				else:
-					return a["title"]
-
-		return None
-
 	node = sorted(node, key=node_sort_key)
+	node = sorted(node, key=node_sort_sparse)
 
 	if recur:
 		for cat in node:
@@ -365,3 +390,36 @@ def get_texts_summaries_for_category(category):
 			return summary
 
 	return []
+
+
+def flatten_toc(toc, include_categories=False, categories_in_titles=False, version_granularity=False):
+	"""
+	Returns an array of strings which corresponds to each category and text in the 
+	Table of Contents in order.
+
+	- categorie_in_titles: whether to include each category preceding a text title, 
+		e.g., "Tanach > Torah > Genesis".
+	- version_granularity: whether to include a seperate entry for every text version.
+	"""
+	results = []
+	for x in toc:
+		name = x.get("category", None) or x.get("title", None)
+		if "category" in x:
+			if include_categories:
+				results += [name]
+			subcats = flatten_toc(x["contents"], categories_in_titles=categories_in_titles)
+			if categories_in_titles:
+				subcats = ["%s > %s" %(name, y) for y in subcats]
+			results += subcats
+
+		elif "title" in x:
+			if not version_granularity:
+				results += [name]
+			else:
+				versions = texts.get_version_list(name)
+				for v in versions:
+					lang = {"he": "Hebrew", "en": "English"}[v["language"]]
+					results += ["%s > %s > %s.json" % (name, lang, v["versionTitle"])]
+
+	return results
+
