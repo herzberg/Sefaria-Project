@@ -38,7 +38,7 @@ def logdecorator(func):
 	dlogger = logging.getLogger(__name__)
 	dlogger.setLevel(logging.DEBUG)
 	formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-	fh = logging.FileHandler('debug.log')
+	fh = logging.FileHandler('/tmp/django_debug.log')
 	fh.setLevel(logging.DEBUG)
 	fh.setFormatter(formatter)
 	if not dlogger.handlers:
