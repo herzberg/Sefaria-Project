@@ -44,7 +44,7 @@ def logdecorator(func):
 	if not dlogger.handlers:
 		dlogger.addHandler(fh)
 	def wrapper(*args, **kwargs):
-		dlogger.debug("Calling {}".format(func.__name__))
+		dlogger.debug("Calling {} with kwargs {}".format(func, kwargs))
 		result = func(*args, **kwargs)
 		dlogger.debug("Returning from {}".format(func))
 		return result
