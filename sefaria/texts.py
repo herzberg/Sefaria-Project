@@ -20,7 +20,7 @@ from bson.objectid import ObjectId
 from django.utils import simplejson as json
 
 # noinspection PyUnresolvedReferences
-from sefaria.utils.util import list_depth, delete_template_cache, union
+from sefaria.utils.util import list_depth, delete_template_cache, union, delete_cache_elem
 from sefaria.utils.users import user_link, is_user_staff
 from sefaria.system.database import db
 from sefaria.utils.hebrew import encode_hebrew_numeral, decode_hebrew_numeral, is_hebrew
@@ -41,7 +41,6 @@ ALLOWED_TAGS = ("i", "b", "br", "u", "strong", "em", "big", "small")
 indices = {}
 he_indices = {}
 parsed = {}
-toc_cache = None
 texts_titles_cache = None
 he_texts_titles_cache = None
 texts_titles_json = None
@@ -2269,10 +2268,10 @@ def reset_texts_cache():
 	global indices, parsed, texts_titles_cache, he_texts_titles_cache, texts_titles_json, toc_cache
 	indices = {}
 	parsed = {}
-	toc_cache = None
 	texts_titles_cache = None
 	he_texts_titles_cache = None
 	texts_titles_json = None
+	delete_cache_elem('toc_cache')
 	delete_template_cache('texts_list')
 	delete_template_cache('leaderboards')
 

@@ -8,9 +8,14 @@ from datetime import datetime
 
 import texts
 import counts
+from sefaria.utils import util
 from sefaria.system.database import db
+import traceback
 
-toc_cache = []
+#toc_cache = []
+#print id(toc_cache)
+#traceback.print_stack()
+
 
 # Giant list ordering or categories
 # indentation and inclusion of duplicate categories (like "Seder Moed")
@@ -101,7 +106,7 @@ def get_toc():
 	Returns table of contents object from in-memory cache,
 	DB or by generating it, as needed. 
 	"""
-	global toc_cache
+	toc_cache = util.get_cache_elem('toc_cache')
 	if toc_cache:
 		return toc_cache
 
@@ -118,10 +123,9 @@ def save_toc(toc):
 	Saves the table of contents object to in-memory cache,
 	invalidtes texts_list cache.
 	"""
-	global toc_cache
-	toc_cache = toc
-	texts.delete_template_cache("texts_list")
-	texts.delete_template_cache("texts_dashboard")
+	util.set_cache_elem('toc_cache', toc, 600000)
+	util.delete_template_cache("texts_list")
+	util.delete_template_cache("texts_dashboard")
 
 
 
@@ -141,7 +145,7 @@ def save_toc_to_db():
 	db.summaries.remove()
 	toc_doc = {
 		"name": "toc",
-		"contents": toc_cache,
+		"contents": util.get_cache_elem('toc_cache'),
 		"dateSaved": datetime.now(),
 	}
 	db.summaries.save(toc_doc)
