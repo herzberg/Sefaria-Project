@@ -207,15 +207,19 @@ def update_summaries_on_change(ref, old_ref=None, recount=True):
 
 	if recount:
 		counts.update_text_count(ref)
-
-	resort_other = False
-	if index["categories"][0] not in order:
-		index["categories"].insert(0, "Other")
-		resort_other = True
-
 	toc = get_toc()
-	node = get_or_make_summary_node(toc, index["categories"])
-	text = add_counts_to_index(index)
+	resort_other = False
+	if index["categories"][0] != "Commentary":
+		if index["categories"][0] not in order:
+			index["categories"].insert(0, "Other")
+			resort_other = True
+		node = get_or_make_summary_node(toc, index["categories"])
+		text = add_counts_to_index(index)
+	else:
+		cats = index["categories"][1:2] + ["Commentary"] + index["categories"][2:]
+		node = get_or_make_summary_node(toc, cats)
+		text = add_counts_to_index(index)
+
 	
 	found = False
 	test_title = old_ref or text["title"]

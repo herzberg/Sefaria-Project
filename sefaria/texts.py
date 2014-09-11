@@ -1866,8 +1866,8 @@ def save_index(index, user, **kwargs):
 
 	# now save with normilzed maps
 	db.index.save(index)
-
-	summaries.update_summaries_on_change(title, old_ref=old_title, recount=bool(old_title)) # only recount if the title changed
+	if index['categories'] and index["categories"][0] != "Commentary":
+		summaries.update_summaries_on_change(title, old_ref=old_title, recount=bool(old_title)) # only recount if the title changed
 
 	# invalidate in-memory cache
 	for variant in index["titleVariants"]:
