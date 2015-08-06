@@ -4,16 +4,17 @@ sheets.py - backend core for Sefaria Source sheets
 Writes to MongoDB Collection: sheets
 """
 import regex
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import dateutil.parser
 
+import sefaria.model as model
 from sefaria.system.database import db
-from sefaria.texts import parse_ref, norm_ref, make_ref_re
+from sefaria.model.notification import Notification, NotificationSet
+from sefaria.model.following import FollowersSet
 from sefaria.model.user_profile import annotate_user_list
-from sefaria.utils.util import strip_tags
+from sefaria.utils.util import strip_tags, string_overlap
 from sefaria.utils.users import user_link
-from sefaria.model.notifications import Notification
 from history import record_sheet_publication, delete_sheet_publication
 from settings import SEARCH_INDEX_ON_SAVE
 import search
@@ -38,7 +39,7 @@ last_updated = {}
 
 def get_sheet(id=None):
 	"""
-	Returns the source sheet with id. 
+	Returns the source sheet with id.
 	"""
 	if id is None:
 		return {"error": "No sheet id given."}
@@ -52,8 +53,8 @@ def get_sheet(id=None):
 
 def get_topic(topic=None):
 	"""
-	Returns the topic sheet with 'topic'. (OUTDATED) 
-	"""	
+	Returns the topic sheet with 'topic'. (OUTDATED)
+	"""
 	if topic is None:
 		return {"error": "No topic given."}
 	s = db.sheets.find_one({"status": 5, "url": topic})
@@ -72,7 +73,7 @@ def sheet_list(user_id=None):
 		sheet_list = db.sheets.find({"status": {"$in": LISTED_SHEETS }}).sort([["dateModified", -1]])
 	elif user_id:
 		sheet_list = db.sheets.find({"owner": int(user_id), "status": {"$ne": 5}}).sort([["dateModified", -1]])
-	
+
 	response = {
 		"sheets": [],
 	}
@@ -84,10 +85,10 @@ def sheet_list(user_id=None):
 		s["author"]   = sheet["owner"]
 		s["size"]     = len(sheet["sources"])
 		s["modified"] = dateutil.parser.parse(sheet["dateModified"]).strftime("%m/%d/%Y")
- 		
- 		response["sheets"].append(s)
+
+		response["sheets"].append(s)
  
- 	return response
+	return response
 
 
 def save_sheet(sheet, user_id):
@@ -124,18 +125,23 @@ def save_sheet(sheet, user_id):
 			sheet["status"] = PRIVATE_SHEET
 		sheet["owner"] = user_id
 		sheet["views"] = 1
-	
+
 	if status_changed:
 		if sheet["status"] in LISTED_SHEETS and "datePublished" not in sheet:
 			# PUBLISH
 			sheet["datePublished"] = datetime.now().isoformat()
 			record_sheet_publication(sheet["id"], user_id)
+			broadcast_sheet_publication(user_id, sheet["id"])
 		if sheet["status"] not in LISTED_SHEETS:
 			# UNPUBLISH
 			delete_sheet_publication(sheet["id"], user_id)
+			NotificationSet({"type": "sheet publish",
+								"content.publisher_id": user_id,
+								"content.sheet_id": sheet["id"]
+							}).delete()
 
 	db.sheets.update({"id": sheet["id"]}, sheet, True, False)
-	
+
 	if sheet["status"] in LISTED_SHEETS and SEARCH_INDEX_ON_SAVE:
 		search.index_sheet(sheet["id"])
 
@@ -156,7 +162,7 @@ def add_source_to_sheet(id, source):
 	sheet["dateModified"] = datetime.now().isoformat()
 	sheet["sources"].append(source)
 	db.sheets.save(sheet)
-	return {"status": "ok", "id": id, "ref": source["ref"]}
+	return {"status": "ok", "id": id, "source": source}
 
 
 def copy_source_to_sheet(to_sheet, from_sheet, source):
@@ -199,36 +205,105 @@ def refs_in_sources(sources):
 	refs = []
 	for source in sources:
 		if "ref" in source:
-			refs.append(source["ref"])
+			text = source.get("text", {}).get("he", None)
+			ref  = refine_ref_by_text(source["ref"], text) if text else source["ref"]
+			refs.append(ref)
 		if "subsources" in source:
 			refs = refs + refs_in_sources(source["subsources"])
-	
+
 	return refs
 
 
-def get_sheets_for_ref(ref, pad=True, context=1):
+def refine_ref_by_text(ref, text):
+	"""
+	Returns a ref (string) which refines 'ref' (string) by comparing 'text' (string),
+	to the hebrew text stored in the Library.
+	"""
+	try:
+		oref   = model.Ref(ref).section_ref()
+	except:
+		return ref
+	needle = strip_tags(text).strip().replace("\n", "")
+	hay    = model.TextChunk(oref, lang="he").text
+
+	start, end = None, None
+	for n in range(len(hay)):
+		if not isinstance(hay[n], basestring):
+			# TODO handle this case
+			# happens with spanning ref like "Shabbat 3a-3b"
+			return ref
+
+		if needle in hay[n]:
+			start, end = n+1, n+1
+			break
+
+		if not start and string_overlap(hay[n], needle):
+			start = n+1
+		elif string_overlap(needle, hay[n]):
+			end = n+1
+			break
+
+	if start and end:
+		if start == end:
+			refined = "%s:%d" % (oref.normal(), start)
+		else:
+			refined = "%s:%d-%d" % (oref.normal(), start, end)
+		ref = refined
+
+	return ref
+
+
+def update_included_refs(hours=1):
+	"""
+	Rebuild included_refs index on all sheets that have been modified
+	in the last 'hours' or all sheets if hours is 0.
+	"""
+	if hours == 0:
+		query = {}
+	else:
+		cutoff = datetime.now() - timedelta(hours=hours)
+		query = { "dateModified": { "$gt": cutoff.isoformat() } }
+
+	db.sheets.ensure_index("included_refs")
+
+	sheets = db.sheets.find(query)
+
+	for sheet in sheets:
+		sources = sheet.get("sources", [])
+		refs = refs_in_sources(sources)
+		db.sheets.update({"_id": sheet["_id"]}, {"$set": {"included_refs": refs}})
+
+
+def get_sheets_for_ref(tref, pad=True, context=1):
 	"""
 	Returns a list of sheets that include ref,
 	formating as need for the Client Sidebar.
-	"""	
-	ref = norm_ref(ref, pad=pad, context=context)
-	ref_re = make_ref_re(ref)
+	"""
+	#tref = norm_ref(tref, pad=pad, context=context)
+	#ref_re = make_ref_re(tref)
+
+	oref = model.Ref(tref)
+	if pad:
+		oref = oref.padded_ref()
+	if context:
+		oref = oref.context_ref(context)
+
+	ref_re = oref.regex()
+
 	results = []
-	sheets = db.sheets.find({"included_refs": {"$regex": ref_re}, "status": {"$in": LISTED_SHEETS}}, 
+	sheets = db.sheets.find({"included_refs": {"$regex": ref_re}, "status": {"$in": LISTED_SHEETS}},
 								{"id": 1, "title": 1, "owner": 1, "included_refs": 1})
 	for sheet in sheets:
 		# Check for multiple matching refs within this sheet
-		matched = [ref for ref in sheet["included_refs"] if regex.match(ref_re, ref)]
-		for match in matched:
-			com = {}
-			anchorRef = parse_ref(match)
-
+		matched_orefs = [model.Ref(r) for r in sheet["included_refs"] if regex.match(ref_re, r)]
+		for match in matched_orefs:
+			com                = {}
 			com["category"]    = "Sheets"
 			com["type"]        = "sheet"
 			com["owner"]       = sheet["owner"]
 			com["_id"]         = str(sheet["_id"])
-			com["anchorRef"]   = match
-			com["anchorVerse"] = anchorRef["sections"][-1]
+			com["anchorRef"]   = match.normal()
+			com["anchorVerse"] = match.sections[-1]
 			com["public"]      = True
 			com["commentator"] = user_link(sheet["owner"])
 			com["text"]        = "<a class='sheetLink' href='/sheets/%d'>%s</a>" % (sheet["id"], strip_tags(sheet["title"]))
@@ -289,18 +364,20 @@ def make_sheet_list_by_tag():
 	return results
 
 
-
-def get_sheets_by_tag(tag):
+def get_sheets_by_tag(tag, public=True, uid=None, group=None):
 	"""
 	Returns all sheets tagged with 'tag'
 	"""
-	if tag:
-		query = {"tags": tag }
-	else:
-		query = {"tags": {"$exists": 0}}
+	query = {"tags": tag } if tag else {"tags": {"$exists": 0}}
 
+	if uid:
+		query["owner"] = uid
+	elif group:
+		query["group"] = group
+	elif public:
+		query["status"] = { "$in": LISTED_SHEETS }
 
-	query["status"] = { "$in": LISTED_SHEETS }
+	print query
 	sheets = db.sheets.find(query).sort([["views", -1]])
 	return sheets
 
@@ -312,7 +389,7 @@ def add_like_to_sheet(sheet_id, uid):
 	db.sheets.update({"id": sheet_id}, {"$addToSet": {"likes": uid}})
 	sheet = get_sheet(sheet_id)
 
-	notification = Notification(uid=sheet["owner"])
+	notification = Notification({"uid": sheet["owner"]})
 	notification.make_sheet_like(liker_id=uid, sheet_id=sheet_id)
 	notification.save()
 
@@ -331,6 +408,57 @@ def likers_list_for_sheet(sheet_id):
 	sheet = get_sheet(sheet_id)
 	likes = sheet.get("likes", [])
 	return(annotate_user_list(likes))
+
+
+def broadcast_sheet_publication(publisher_id, sheet_id):
+	"""
+	Notify everyone who follows publisher_id about sheet_id's publication
+	"""
+	followers = FollowersSet(publisher_id)
+	for follower in followers.uids:
+		n = Notification({"uid": follower})
+		n.make_sheet_publish(publisher_id=publisher_id, sheet_id=sheet_id)
+		n.save()
+
+
+def make_sheet_from_text(text, sources=None, uid=1, generatedBy=None, title=None):
+	"""
+	Creates a source sheet owned by 'uid' that includes all of 'text'.
+	'sources' is a list of strings naming commentators or texts to includes a subsources.
+	"""
+	oref  = model.Ref(text)
+	sheet = {
+		"title": title if title else oref.normal() if not sources else oref.normal() + " with " + ", ".join([s.replace(" on " + text, "") for s in sources]),
+		"sources": [],
+		"status": 0,
+		"options": {"numbered": 0, "divineNames": "noSub"},
+		"generatedBy": generatedBy or "make_sheet_from_text",
+		"promptedToPublish": datetime.now().isoformat(),
+	}
+
+	i     = oref.index
+	leafs = i.nodes.get_leaf_nodes()
+	for leaf in leafs:
+		refs = []
+		if leaf.first_section_ref() != leaf.last_section_ref():
+			leaf_spanning_ref = leaf.first_section_ref().to(leaf.last_section_ref())
+			refs += [ref for ref in leaf_spanning_ref.split_spanning_ref() if oref.contains(ref)]
+		else:
+			refs.append(leaf.ref())
+
+		for ref in refs:
+			ref_dict = { "ref": ref.normal() }
+			if sources:
+				ref_dict["subsources"] = []
+				subsources = ref.linkset().filter(sources)
+				for sub in subsources:
+					subref = sub.refs[1] if regex.match(ref.regex(), sub.refs[0]) else sub.refs[0]
+					ref_dict["subsources"].append({"ref": subref})
+				ref_dict["subsources"] = sorted(ref_dict["subsources"], key=lambda x : x["ref"])
+
+			sheet["sources"].append(ref_dict)
+
+	return save_sheet(sheet, uid)
 
 
 

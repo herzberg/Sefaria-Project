@@ -3,9 +3,12 @@ users.py - dealing with Sefaria users and user settings
 
 Writes to MongoDB Collection: profiles
 """
-
-from django.contrib.auth.models import User
+import sys
 from sefaria.system.database import db
+
+if not hasattr(sys, '_doc_build'):
+	from django.contrib.auth.models import User
+
 
 def user_name(uid):
 	"""Returns a string of a user's full name"""
@@ -17,7 +20,7 @@ def user_name(uid):
 	except:
 		# Don't choke on unknown users, just leave a placeholder
 		# (so that testing on history can happen without needing the user DB)
-		name = "User %d" % uid
+		name = "User {}".format(uid)
 	return name
 
 
@@ -48,3 +51,19 @@ def is_user_staff(uid):
 		return user.is_staff
 	except:
 		return False
+
+
+def user_started_text(uid, title):
+	"""
+	Returns true if uid was responsible for first adding 'title'
+	to the library.
+
+	This checks for the oldest matching index change record for 'title'.
+	If someone other than the initiator changed the text's title, this function
+	will incorrectly report False, but this matches our intended behavior to 
+	lock name changes after an admin has stepped in.
+	"""
+	log = db.history.find({"title": title}).sort([["date", -1]]).limit(1)
+	if log.count():
+		return log[0]["user"] == uid
+	return False

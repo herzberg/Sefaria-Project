@@ -6,11 +6,11 @@ Depends largely on counts.py for knowing what work is complete and incomplete.
 
 from random import sample, shuffle
 
+from sefaria.model import *
 # noinspection PyUnresolvedReferences
 from sefaria.system.database import db
-from texts import *
 import summaries
-import counts
+from utils.talmud import section_to_daf
 
 
 def next_untranslated_ref_in_text(text, section=None, enCounts=None, tryNext=True):
@@ -20,25 +20,23 @@ def next_untranslated_ref_in_text(text, section=None, enCounts=None, tryNext=Tru
 
 	* section  - optinally restrict the search to a particular section
 	* enCounts - a jagged array of counts of available english texted, assumed to 
-			     already have been marked for locked texts.
+				 already have been marked for locked texts.
 	* tryNext  - when a section is specified, but no ref is found, should we move on
 				 to the next section or just fail?
 	"""
-	pRef = parse_ref(text)
-	if "error" in pRef:
-		return pRef
+	oref = Ref(text).padded_ref()
 
 	if not enCounts:
-		bcounts = db.counts.find_one({"title": pRef["book"]})
-		if not bcounts:
-			return {"error": "No counts found for %s" % text}
+		state = oref.get_state_node()
+		if not state:
+			return {"error": "No state found for %s" % text}
 
-		en = bcounts["availableTexts"]["en"]
+		en = state.var("en", "availableTexts")
 		enCounts = mark_locked(text, en)
 
 	if section:
 		try:
-			en = enCounts[section-1]
+			en = enCounts[section - 1]
 		except:
 			# This section is out of bounds
 			return None
@@ -50,19 +48,19 @@ def next_untranslated_ref_in_text(text, section=None, enCounts=None, tryNext=Tru
 		if section and tryNext:
 			# If a section was specified, but nothing was found
 			# try moving on to the next 
-			return next_untranslated_ref_in_text(text, section=section+1, enCounts=enCounts)
+			return next_untranslated_ref_in_text(text, section=section + 1, enCounts=enCounts)
 		else:
 			return None
 
 	if section:
-		indices = [section-1] + indices
+		indices = [section - 1] + indices
 
-	if pRef["categories"][0] == "Talmud":
-		sections = [section_to_daf(indices[0])] + [str(x+1) for x in indices[1:]]
+	if oref.is_talmud():
+		sections = [section_to_daf(indices[0] + 1)] + [str(x + 1) for x in indices[1:]]
 	else:
-		sections = [str(x+1) for x in indices]
+		sections = [str(x + 1) for x in indices]
 
-	return pRef["book"] + " " + ":".join(sections)
+	return oref.book + " " + ":".join(sections)
 
 
 def random_untranslated_ref_in_text(text, skip=None):
@@ -72,13 +70,13 @@ def random_untranslated_ref_in_text(text, skip=None):
 
 	* skip  - a section number to disallow (so users wont get the same section twice in a row when asking for random)
 	"""
-	c = counts.get_counts_doc(text)
-	if not c:
+	state = StateNode(text)
+	if not state:
 		return None
 
-	enCounts = mark_locked(text, c["availableTexts"]["en"])
+	enCounts = mark_locked(text, state.var("en", "availableTexts"))
 
-	options = range(len(c["availableTexts"]["he"]))
+	options = range(len(state.var("he", "availableTexts")))
 	shuffle(options)
 	if skip:
 		options = [x for x in options if x != skip]
@@ -108,6 +106,7 @@ def next_untranslated_text_in_category(category, skip=0):
 
 
 def random_untranslated_text_in_category(cat):
+	#todo: move to object model.  But is this used anymore?
 	"""
 	Return the name of a random text in 'cat' which is not
 	completely translated.
@@ -135,15 +134,16 @@ def mark_locked(text, counts):
 							"version": "Sefaria Community Translation",
 						})
 	for lock in locks:
-		pRef = parse_ref(lock["ref"])
-		if pRef["book"] != text: continue
+		#pRef = parse_ref(lock["ref"])
+		oref = Ref(lock["ref"]).padded_ref()
+		if oref.book != text: continue
 		# reach into the jagged array to find the right
 		# position to set
 		zoom = counts
-		for i in range(pRef["textDepth"]-1):
-			zoom = zoom[pRef["sections"][i] - 1]
+		for i in range(oref.index_node.depth-1):
+			zoom = zoom[oref.sections[i] - 1]
 		try:
-			zoom[pRef["sections"][-1]-1] = 1
+			zoom[oref.sections[-1]-1] = 1
 		except:
 			pass # A lock exists that refers to a now out of range segment; ignore.
 

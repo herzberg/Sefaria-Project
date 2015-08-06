@@ -2,21 +2,27 @@
 """
 Custom Sefaria Tags for Django Templates
 """
+import json
+import re
 import dateutil.parser
+import urllib
+from urlparse import urlparse
+
 from django import template
 from django.template.defaultfilters import stringfilter
 from django.utils.safestring import mark_safe
 from django.core.serializers import serialize
 from django.db.models.query import QuerySet
-from django.utils import simplejson
 from django.contrib.sites.models import Site
 
-from sefaria.texts import url_ref, parse_ref, get_index
 from sefaria.sheets import get_sheet
 from sefaria.utils.users import user_link as ulink
 from sefaria.utils.util import strip_tags as strip_tags_func
+from sefaria.utils.hebrew import hebrew_plural, hebrew_term
+from sefaria.utils.hebrew import hebrew_term as translate_hebrew_term
 
-import re
+import sefaria.model.text
+import sefaria.model as m
 
 
 register = template.Library()
@@ -37,12 +43,98 @@ def ref_link(value, absolute=False):
 		return ref_link_cache[value]
 	if not value:
 		return ""
-	pRef = parse_ref(value, pad=False)
-	if "error" in pRef:
-		return value
-	link = '<a href="/' + url_ref(value) + '">' + value + '</a>'
+	try:
+		oref = m.Ref(value)
+		link = '<a href="/' + oref.url() + '">' + value + '</a>'
+	except:
+		link = value
 	ref_link_cache[value] = mark_safe(link)
 	return ref_link_cache[value]
+
+
+he_ref_link_cache = {} # simple cache for ref links
+@register.filter(is_safe=True)
+@stringfilter
+def he_ref_link(value, absolute=False):
+	"""
+	Transform a ref into an <a> tag linking to that ref in Hebrew.
+	e.g. "Genesis 1:3" -> "<a href='/Genesis.1.2'>בראשית, א, ב</a>"
+	"""
+	if value in he_ref_link_cache:
+		return he_ref_link_cache[value]
+	if not value:
+		return ""
+	try:
+		oref = m.Ref(value)
+		link = '<a class="heRef" href="/' + oref.url() + '">' + re.sub(r"\d+(-\d+)?", "", oref.he_normal()) + '</a>'
+	except:
+		link = '<a class="heRef" href="#invalid-ref">' + value + '</a>'
+	he_ref_link_cache[value] = mark_safe(link)
+	return he_ref_link_cache[value]
+
+
+@register.filter(is_safe=True)
+@stringfilter
+def he_ref(value):
+	"""
+	Returns a Hebrew ref for the english ref passed in.
+	"""
+	if not value:
+		return ""
+	try:
+		oref = m.Ref(value)
+		he   = oref.he_normal()
+	except:
+		he   = value
+
+	return he
+
+@register.filter(is_safe=True)
+@stringfilter
+def he_parasha(value):
+	"""
+	Returns a Hebrew ref for the english ref passed in.
+	"""
+	if not value:
+		return ""
+	
+	def hebrew_parasha(p):
+		try:
+			term    = m.Term().load({"name": p, "scheme": "Parasha"})
+			parasha = term.get_titles(lang="he")[0]
+		except Exception, e:
+			print e
+			parasha   = p
+		return parasha
+	names = value.split("-")
+	return ("-").join(map(hebrew_parasha, names)) if value != "Lech-Lecha" else hebrew_parasha(value)
+
+
+@register.filter(is_safe=True)
+def version_link(v):
+	"""
+	Return an <a> tag linking to the first availabe text of a particular version.
+	"""
+	section = "1"
+	link = u'<a href="/{}.{}/{}/{}">{}</a>'.format(v.title, section, v.language, v.versionTitle.replace(" ", "_"), v.versionTitle)
+	return mark_safe(link)
+
+
+@register.filter(is_safe=True)
+def version_source_link(v):
+	"""
+	Return an <a> tag linking to the versionSource, or to a Google Search for the source.
+	"""
+	if " " in v.versionSource or "." not in v.versionSource:
+		href       = "http://www.google.com/search?q=" + urllib.quote(v.versionSource.encode('utf8'))
+		val        = v.versionSource
+	else:
+		parsed_uri = urlparse( v.versionSource )
+		href       = v.versionSource
+		val        = parsed_uri.netloc
+
+	link = u'<a class="versionSource" href="{}" target="_blank">{}</a>'.format(href, val)
+	return mark_safe(link)
 
 
 @register.filter(is_safe=True)
@@ -51,9 +143,11 @@ def url_safe(value):
 	safe = value.replace(" ", "_")
 	return mark_safe(safe)
 
+
 @register.filter(is_safe=True)
 def prettify_url(value):
 	return re.sub(r'^https?:\/\/', '', value, flags=re.MULTILINE)
+
 
 @register.filter(is_safe=True)
 def normalize_url(value):
@@ -79,8 +173,12 @@ def lang_code(code):
 @register.filter(is_safe=True)
 def text_category(text):
 	"""Returns the top level category for text"""
-	i = get_index(text)
-	return mark_safe(i.get("categories", ["[no cats]"])[0])
+	try:
+		i = m.get_index(text)
+		result = mark_safe(getattr(i, "categories", ["[no cats]"])[0])
+	except: 
+		result = "[text not found]"
+	return result
 
 
 @register.filter(is_safe=True)
@@ -116,6 +214,27 @@ def sheet_link(value):
 
 
 @register.filter(is_safe=True)
+def discussion_link(discussion):
+	"""
+	Returns a link to layer with id value.
+
+	:param discussion is either a Layer object or a urlkey for a Layer object.
+	"""
+	if isinstance(discussion, basestring):
+		discussion = m.Layer().load({"urlkey": discussion})
+		if not discussion:
+			return mark_safe("[discusion not found]")
+	if getattr(discussion, "first_ref", None):
+		oref = m.Ref(discussion.first_ref)
+		href = "/" + oref.url() + "?layer=" + discussion.urlkey
+		count = len(discussion.note_ids)
+		safe = "<a href='{}'>{} ({} notes)</a>".format(href, oref.normal(), count)
+	else:
+		safe = "<a href='/Genesis.1?layer=" + discussion.urlkey + "'>Unstarted Discussion</a>"
+	return mark_safe(safe)
+
+
+@register.filter(is_safe=True)
 def absolute_link(value):
 	"""
 	Takes a string with a single <a> tag a replaces the href with absolute URL.
@@ -126,6 +245,23 @@ def absolute_link(value):
 	absolute = absolute.replace('href="/', 'href="http://%s/' % domain)
 	return mark_safe(absolute)
 
+
+@register.filter(is_safe=True)
+def license_link(value):
+	"""
+	Returns the text of an <a> tag linking to a page explaining a license.
+	"""
+	links = {
+		"Public Domain": "http://en.wikipedia.org/wiki/Public_domain",
+		"CC0":           "http://creativecommons.org/publicdomain/zero/1.0/",
+		"CC-BY":         "http://creativecommons.org/licenses/by/3.0/",
+		"CC-BY-SA":      "http://creativecommons.org/licenses/by-sa/3.0/",
+	}
+
+	if value not in links:
+		return mark_safe(value)
+
+	return mark_safe("<a href='%s' target='_blank'>%s</a>" % (links[value], value))
 
 
 @register.filter(is_safe=True)
@@ -138,7 +274,6 @@ def trim_title(value):
 	safe = safe.replace(u"משנה תורה, ", "")
 
 	return mark_safe(safe)
-
 
 
 @register.filter(is_safe=True)
@@ -166,8 +301,6 @@ def abbreviate_number(value):
 	else:
 		abbr = str(n)
 
-
-
 	return mark_safe(abbr)
 
 
@@ -177,34 +310,36 @@ def sum_counts(counts):
 
 
 @register.filter(is_safe=True)
-def text_progress_bars(text):
-	if text.percentAvailable:
-		html = """
-		<div class="progressBar heAvailable" style="width:{{ text.percentAvailable.he|floatformat|default:'0' }}%">
-		</div>
-		<div class="progressBar enAvailable" style="width:{{ text.percentAvailable.en|floatformat|default:'0' }}%">
-		</div>
-		"""
-	else:
-		html = """
-		<div class="progressBar heAvailable" style="width:{{ text.availableCounts.he|sum_counts }}%">
-		</div>
-		<div class="progressBar enAvailable" style="width:{{ text.availableCounts.en|sum_counts }}%">
-		</div>
-		"""
-	return sum(counts.values())
+def percent_available(array, key):
+	return array[key]["percentAvailable"]
+
+
+@register.filter(is_safe=True)
+def pluralize(value):
+	"""
+	Hebrew friendly plurals
+	"""
+	return mark_safe(hebrew_plural(value))
+
+
+@register.filter(is_safe=True)
+def hebrew_term(value):
+	"""
+	Hebrew friendly plurals
+	"""
+	return mark_safe(translate_hebrew_term(value))
 
 
 @register.filter(is_safe=True)
 def jsonify(object):
-    if isinstance(object, QuerySet):
-        return mark_safe(serialize('json', object))
-    return mark_safe(simplejson.dumps(object))
+	if isinstance(object, QuerySet):
+		return mark_safe(serialize('json', object))
+	return mark_safe(json.dumps(object))
 
 
 @register.simple_tag 
 def get_private_attribute(model_instance, attrib_name): 
-        return getattr(model_instance, attrib_name, '') 
+		return getattr(model_instance, attrib_name, '')
 
 
 @register.filter(is_safe=True)

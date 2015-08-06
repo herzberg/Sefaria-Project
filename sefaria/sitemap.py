@@ -6,8 +6,7 @@ Outputs sitemaps and sitemapindex to the first entry of STATICFILES_DIRS.
 import os
 from datetime import datetime
 
-from texts import *
-from counts import generate_refs_list
+from sefaria.model import *
 from sefaria.system.database import db
 from settings import STATICFILES_DIRS
 from sefaria.sheets import LISTED_SHEETS
@@ -31,11 +30,11 @@ static_urls = [
 
 
 def chunks(l, n):
-    """ 
-    Yield successive n-sized chunks from l.
-    """
-    for i in xrange(0, len(l), n):
-        yield l[i:i+n]
+	"""
+	Yield successive n-sized chunks from l.
+	"""
+	for i in xrange(0, len(l), n):
+		yield l[i:i+n]
 
 
 def generate_texts_sitemaps():
@@ -43,22 +42,23 @@ def generate_texts_sitemaps():
 	Create sitemap for each text section for which content is available.
 	Returns the number of files written (each sitemap can have only 50k URLs)
 	"""
-	refs = generate_refs_list()
-	urls = ["http://www.sefaria.org/" + url_ref(ref) for ref in refs if url_ref(ref)]
-	
+	#refs = generate_refs_list()
+	refs = library.ref_list()
+	urls = ["http://www.sefaria.org/" + oref.url() for oref in refs]
+
 	maps = list(chunks(urls, 40000))
 
 	for n in range(len(maps)):
 		write_urls(maps[n], "texts-sitemap%d.txt" % n)
 
 	return len(maps)
-	
+
 
 def generate_sheets_sitemap():
 	"""
 	Creates a sitemap for each public source sheet.
 	"""
- 	query = {"status": {"$in": LISTED_SHEETS}}
+	query = {"status": {"$in": LISTED_SHEETS}}
 	public = db.sheets.find(query).distinct("id")
 	urls = ["http://www.sefaria.org/sheets/" + str(id) for id in public]
 
@@ -89,8 +89,8 @@ def generate_sitemap_index(sitemaps):
 	for m in sitemaps:
 		xml += """
 		   <sitemap>
-		      <loc>http://www.sefaria.org/static/%s</loc>
-		      <lastmod>%s</lastmod>
+			  <loc>http://www.sefaria.org/static/%s</loc>
+			  <lastmod>%s</lastmod>
 		   </sitemap>
 		   """ % (m, now)
 
@@ -108,7 +108,7 @@ def generate_sitemap_index(sitemaps):
 
 def generate_sitemaps():
 	"""
-	Creates all sitemap files then creates and index file for all. 
+	Creates all sitemap files then creates and index file for all.
 	"""
 	generate_static_sitemap()
 	generate_sheets_sitemap()

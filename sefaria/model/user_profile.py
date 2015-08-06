@@ -2,15 +2,17 @@ import hashlib
 import urllib
 import re
 import bleach
+import sys
 
-from django.contrib.auth.models import User
-from django.core.mail import EmailMultiAlternatives
-from django.template.loader import render_to_string
-from django.core.validators import URLValidator, EmailValidator
-from django.core.exceptions import ValidationError
+if not hasattr(sys, '_doc_build'):
+	from django.contrib.auth.models import User
+	from django.core.mail import EmailMultiAlternatives
+	from django.template.loader import render_to_string
+	from django.core.validators import URLValidator, EmailValidator
+	from django.core.exceptions import ValidationError
 
 from sefaria.model.following import FollowersSet, FolloweesSet
-from sefaria.model.notifications import NotificationSet
+from sefaria.model.notification import NotificationSet
 from sefaria.system.database import db
 from sefaria.utils.users import user_link, user_links
 
@@ -24,16 +26,24 @@ class UserProfile(object):
 				self.__init__(id=profile["id"])
 				return
 
-		user = User.objects.get(id=id)
-
-		self.first_name         = user.first_name
-		self.last_name          = user.last_name
-		self.email              = user.email
-
+		try:
+			user = User.objects.get(id=id)
+			self.first_name     = user.first_name
+			self.last_name      = user.last_name
+			self.email          = user.email
+			self.date_joined    = user.date_joined
+		except:
+			# These default values allow profiles to function even
+			# if the Django User records are missing (for testing)
+			self.first_name     = "User"
+			self.last_name      = str(id)
+			self.email          = "test@sefaria.org"
+			self.date_joined    = None
+ 
 		self._id                = None  # Mongo ID of profile doc
 		self.id                 = id    # user ID
 		self.slug               = ""
- 		self.position           = ""
+		self.position           = ""
 		self.organization       = ""
 		self.jewish_education   = []
 		self.bio                = ""
@@ -63,11 +73,14 @@ class UserProfile(object):
 		self.followees = FolloweesSet(self.id)
 
 		# Gravatar
-		default_image           = "http://inclusiveinnovationhub.org/assets/avatars/missing_large.png" # "http://www.sefaria.org/static/img/profile-default.png"
-		gravatar_base           = "http://www.gravatar.com/avatar/" + hashlib.md5(user.email.lower()).hexdigest() + "?"
+		default_image           = "http://www.sefaria.org/static/img/profile-default.png"
+		gravatar_base           = "http://www.gravatar.com/avatar/" + hashlib.md5(self.email.lower()).hexdigest() + "?"
 		self.gravatar_url       = gravatar_base + urllib.urlencode({'d':default_image, 's':str(250)})
 		self.gravatar_url_small = gravatar_base + urllib.urlencode({'d':default_image, 's':str(80)})
 
+	@property
+	def full_name(self):
+		return self.first_name + " " + self.last_name
 
 	def update(self, obj):
 		"""
@@ -129,16 +142,21 @@ class UserProfile(object):
 		url_val = URLValidator()
 		try:
 			if self.facebook: url_val(self.facebook)
+		except ValidationError, e:
+			return "The Facebook URL you entered is not valid."
+		try:
 			if self.linkedin: url_val(self.linkedin)
+		except ValidationError, e:
+			return "The LinkedIn URL you entered is not valid."
+		try:
 			if self.website: url_val(self.website)
 		except ValidationError, e:
-			return "please enter a valid URL"
-
+			return "The Website URL you entered is not valid."
 		email_val = EmailValidator()
 		try:
 			if self.email: email_val(self.email)
 		except ValidationError, e:
-			return "Please enter a valid email."
+			return "The email address you entered is not valid."
 
 		return None
 
@@ -185,6 +203,7 @@ class UserProfile(object):
 			"youtube":          self.youtube,
 			"pinned_sheets":    self.pinned_sheets,
 			"settings":         self.settings,
+			"tag_order":       getattr(self, "tag_order", None),
 		}
 		return dictionary
 
@@ -218,7 +237,7 @@ def email_unread_notifications(timeframe):
 		message_html = render_to_string("email/notifications_email.html", { "notifications": notifications, "recipient": user.first_name })
 		#message_text = util.strip_tags(message_html)
 		subject      = "New Activity on Sefaria from %s" % notifications.actors_string()
-		from_email   = "The Sefaria Project <hello@sefaria.org>"
+		from_email   = "Sefaria <hello@sefaria.org>"
 		to           = user.email
 
 		msg = EmailMultiAlternatives(subject, message_html, from_email, [to])
